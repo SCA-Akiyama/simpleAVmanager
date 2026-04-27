@@ -1,0 +1,22 @@
+{
+  "name": "simpleavmanager",
+  "module": "main.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot run main.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@picocss/pico": "^2.1.1",
+    "lucide": "^1.11.0",
+    "vanjs-core": "^1.6.0",
+    "vanjs-ext": "^0.6.3",
+    "zod": "^4.3.6"
+  }
+}
