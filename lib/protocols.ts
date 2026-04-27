@@ -56,3 +56,21 @@ export class UdpTask implements ControlTask {
     return ""; // UDPは返事がないので空文字を返す
   }
 }
+
+export type ProtocolType = "TCP" | "UDP"; // 将来的に "HTTP" や "SERIAL" を追加可能
+
+export const TaskFactory = {
+  create: (
+    protocol: ProtocolType,
+    config: { id: string; ip: string; port: number; payload: string }
+  ): ControlTask => {
+    switch (protocol) {
+      case "TCP":
+        return new TcpTask(config.id, config.ip, config.port, config.payload);
+      case "UDP":
+        return new UdpTask(config.id, config.ip, config.port, config.payload);
+      default:
+        throw new Error(`Unsupported protocol: ${protocol}`);
+    }
+  },
+};

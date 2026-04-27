@@ -42,10 +42,12 @@ const server = Bun.serve({
   }
 });
 
-setInterval(() => {
-  deviceManager.syncAll().then(() => {
-    server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
-  });
-}, 10000);
+const runSyncLoop = async () => {
+  await deviceManager.syncAll();
+  // 同期が終わってから10秒待って、次を実行する
+  server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
+  setTimeout(runSyncLoop, 10000);
+};
 
+runSyncLoop();
 console.log(`🚀 Server started at http://localhost:${server.port}`);

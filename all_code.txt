@@ -91,30 +91,81 @@ export const stateDb = {
 };
 
 
+--- D:\Projects\simpleAVmanager\lib\factory.ts ---
+
+// src/lib/factory.ts
+import { TaskFactory, type ProtocolType } from "./protocols";
+import type { AVDevice } from "./types";
+
+// 繝・ヰ繧､繧ｹ縺ｮ縲悟ｮ夂ｾｩ縲阪・蝙九ゆｽ懆・・縺薙ｌ縺縺代ｒ譖ｸ縺上・
+export interface DeviceDefinition<T = any> {
+  readonly type: string;
+  readonly protocol: ProtocolType;
+  readonly defaultPort: number;
+  readonly states: Record<string, {
+    translate: (v: any) => string;
+    parse: (raw: string) => any;
+  }>;
+  readonly events?: Record<string, {
+    translate: (v: any) => string;
+  }>;
+  readonly toleratedStates?: Record<string, Record<string, string[]>>;
+}
+
+/**
+ * 邏皮ｲ九↑螳夂ｾｩ繝・・繧ｿ縺九ｉ縲［anager縺梧桶縺医ｋ AVDevice 繧ｪ繝悶ず繧ｧ繧ｯ繝医ｒ蜷域・縺吶ｋ
+ */
+export const createDevice = <T>(
+  def: DeviceDefinition<T>,
+  config: { id: string; ip: string; port?: number }
+): AVDevice<T> => {
+  const port = config.port ?? def.defaultPort;
+
+  return {
+    id: config.id,
+    type: def.type,
+    // states 縺ｮ繧ｭ繝ｼ縺九ｉ閾ｪ蜍慕噪縺ｫ statusKeys 繧堤函謌・[cite: 51, 68, 83]
+    statusKeys: Object.keys(def.states),
+    toleratedStates: def.toleratedStates,
+
+    _schema: undefined as T,
+
+    translate(key, value) {
+      // 1. 蝠上＞蜷医ｏ縺帙さ繝槭Φ繝峨・蜈ｱ騾壼・逅・
+      if (value === "?") {
+        const handler = def.states[key];
+        if (!handler) return null;
+        const payload = handler.translate("?");
+        return TaskFactory.create(def.protocol, { ...config, port, payload });
+      }
+
+      // 2. 騾壼ｸｸ繧ｳ繝槭Φ繝峨・蜃ｦ逅・(states 縺ｾ縺溘・ events 縺九ｉ讀懃ｴ｢)
+      const handler = (def.states as any)[key] || (def.events as any)?.[key];
+      const payload = handler?.translate(value);
+      
+      return payload 
+        ? TaskFactory.create(def.protocol, { ...config, port, payload: String(payload) })
+        : null;
+    },
+
+    parseResponse(key, raw) {
+      return def.states[key]?.parse(raw) ?? raw.trim();
+    }
+  };
+};
+
+
 --- D:\Projects\simpleAVmanager\lib\inventory.ts ---
 
 // src/lib/inventory.ts
-import { PjLinkDevice } from "./devices/PjLinkDevice";
-import { BrightSignDevice } from "./devices/BrightSignDevice";
+import { createDevice } from "./factory";
+import { pjLinkDef } from "./devices/PjLinkDevice";
+import { brightSignDef } from "./devices/BrightSignDevice";
 
-// 莉雁ｾ後ｄ繧九％縺ｨ縺ｯ縲√％縺ｮ驟榊・縺ｫ讖滓攝繧・陦瑚ｶｳ縺吶％縺ｨ縺縺托ｼ・
 export const inventory = [
-  new PjLinkDevice("pj-01", "192.168.1.100"),
-  new BrightSignDevice("bs-01", "192.168.1.110"),
-] as const; // 笘・as const 繧剃ｻ倥￠繧九・縺後・繧､繝ｳ繝・
-
-// --- 縲蝉ｸ蠎ｦ縺縺第嶌縺城ｭ疲ｳ輔代％繧御ｻ･髯阪・莠悟ｺｦ縺ｨ隗ｦ繧峨↑縺上※OK ---
-export type FrontendDevice = typeof inventory[number] extends { 
-  id: infer I, 
-  type: infer T, 
-  // 繧ｯ繝ｩ繧ｹ蜀・・ _schema 縺九ｉ蝙九ｒ謚ｽ蜃ｺ・亥燕蝗樊署譯医・繝昴こ繝・ヨ・・
-  _schema?: infer S 
-} ? { 
-  id: I, 
-  type: T, 
-  desired: Partial<S>, 
-  actual: Partial<S> 
-} : never;
+  createDevice(pjLinkDef, { id: "pj-01", ip: "192.168.1.100" }),
+  createDevice(brightSignDef, { id: "bs-01", ip: "192.168.1.110" }), 
+] as const;
 
 
 --- D:\Projects\simpleAVmanager\lib\manager.ts ---
@@ -317,6 +368,24 @@ export class UdpTask implements ControlTask {
   }
 }
 
+export type ProtocolType = "TCP" | "UDP"; // 蟆・擂逧・↓ "HTTP" 繧・"SERIAL" 繧定ｿｽ蜉蜿ｯ閭ｽ
+
+export const TaskFactory = {
+  create: (
+    protocol: ProtocolType,
+    config: { id: string; ip: string; port: number; payload: string }
+  ): ControlTask => {
+    switch (protocol) {
+      case "TCP":
+        return new TcpTask(config.id, config.ip, config.port, config.payload);
+      case "UDP":
+        return new UdpTask(config.id, config.ip, config.port, config.payload);
+      default:
+        throw new Error(`Unsupported protocol: ${protocol}`);
+    }
+  },
+};
+
 
 --- D:\Projects\simpleAVmanager\lib\types.ts ---
 
@@ -341,250 +410,105 @@ export interface AVDevice<TSchema = any> {
 
 --- D:\Projects\simpleAVmanager\lib\devices\BrightSignDevice.ts ---
 
-// src/lib/devices/BrightSignDevice.ts
-import { UdpTask } from "../protocols";
-import type { AVDevice } from "../types";
+import type { DeviceDefinition } from "../factory"; // [cite: 12]
 
-// 繝輔Ο繝ｳ繝医お繝ｳ繝峨・髢狗匱譎ゅ↓陬懷ｮ後＆繧後ｋ繧ｹ繧ｭ繝ｼ繝槫ｮ夂ｾｩ
 export type BrightSignSchema = {
-  // UDP讖滓攝縺ｯ蝓ｺ譛ｬ逧・↓荳譁ｹ騾夊｡後・縺溘ａ縲√％縺薙↓螳夂ｾｩ縺励◆繧ｭ繝ｼ縺ｯ縲後う繝吶Φ繝医阪→縺励※謇ｱ繧上ｌ縺ｾ縺・
-  power?: "on" | "off";
-  play?: string;
   command?: string;
 };
 
-export class BrightSignDevice implements AVDevice<BrightSignSchema> {
-  // 譛譁ｰ縺ｮ隴伜挨繝ｫ繝ｼ繝ｫ: 繧ｯ繝ｩ繧ｹ蜷・+ as const
-  public readonly type = "BrightSignDevice" as const;
+export const brightSignDef: DeviceDefinition<BrightSignSchema> = {
+  type: "BrightSignDevice",
+  protocol: "UDP", // [cite: 58]
+  defaultPort: 5000, // [cite: 58]
 
-  // ==========================================
-  // 1. 迥ｶ諷・(States): parse・郁ｧ｣譫撰ｼ峨′縲仙ｿ・医代↑繧ｰ繝ｫ繝ｼ繝・
-  // ==========================================
-  // BrightSign縺ｯUDP縺ｮ荳譁ｹ騾夊｡後〒迥ｶ諷句叙蠕励′縺ｧ縺阪↑縺・◆繧√√％縺薙↓縺ｯ菴輔ｂ螳夂ｾｩ縺励∪縺帙ｓ縲・
-  // 縺薙ｌ縺ｫ繧医ｊ statusKeys 縺ｯ閾ｪ蜍慕噪縺ｫ遨ｺ驟榊・ [] 縺ｫ縺ｪ繧翫∪縺吶・
-  private readonly states = {
-  } satisfies Record<string, { translate: (v: any) => string; parse: (raw: string) => string }>;
+  // BrightSign縺ｯ迥ｶ諷句叙蠕暦ｼ・uery・峨′縺ｧ縺阪↑縺・ｻ墓ｧ倥・縺溘ａ states 縺ｯ遨ｺ縺ｫ縺吶ｋ [cite: 58]
+  states: {},
 
-  // ==========================================
-  // 2. 繧､繝吶Φ繝・(Events): parse 縺後蝉ｸ崎ｦ√代↑繧ｰ繝ｫ繝ｼ繝・
-  // ==========================================
-  private readonly events = {
-    power: {
-      translate: (v: any) => v === "on" ? "PowerOn" : "PowerOff" // 螳滓ｩ溘・繧ｳ繝槭Φ繝我ｻ墓ｧ倥↓蜷医ｏ縺帙ｋ
-    },
-    play: {
-      translate: (v: any) => `play:${v}`
-    },
+  // 逋ｺ陦鯉ｼ・et・峨・縺ｿ縺ｮ繧ｳ繝槭Φ繝峨ｒ events 縺ｫ螳夂ｾｩ [cite: 59]
+  events: {
     command: {
-      translate: (v: any) => String(v)
+      translate: (v) => String(v)
     }
-  } satisfies Record<string, { translate: (v: any) => string }>;
-
-  // states 縺ｮ繧ｭ繝ｼ縺九ｉ閾ｪ蜍慕函謌撰ｼ医％縺ｮ讖滓攝縺ｮ蝣ｴ蜷医・ [] 縺ｫ縺ｪ繧具ｼ・
-  public readonly statusKeys = Object.keys(this.states);
-
-  constructor(public id: string, public ip: string, public port = 5000) {}
-
-  translate(key: string, value: any) {
-    // 蝠上＞蜷医ｏ縺幢ｼ・・峨′譚･縺溷ｴ蜷医・UDP讖滓攝縺ｪ縺ｮ縺ｧ null 繧定ｿ斐＠縺ｦ繧ｹ繧ｭ繝・・縺輔○繧・[cite: 46]
-    if (value === "?") return null;
-
-    // states 縺・events 縺ｮ縺ｩ縺｡繧峨°縺九ｉ繝上Φ繝峨Λ繝ｼ繧呈爾縺・[cite: 63, 64]
-    const handler = (this.states as any)[key] || (this.events as any)[key];
-    const payload = handler?.translate(value);
-    
-    // UdpTask 縺ｨ縺励※逕滓・縺励※霑斐☆ [cite: 47]
-    return payload ? new UdpTask(this.id, this.ip, this.port, String(payload)) : null;
   }
-
-  parseResponse(key: string, raw: string) {
-    // states 蛛ｴ縺ｫ螳夂ｾｩ縺後↑縺・ｩ滓攝・・DP讖滓攝・峨〒繧ゅ√・繝阪・繧ｸ繝｣繝ｼ縺九ｉ蜻ｼ縺ｰ繧後ｋ縺溘ａ螳溯｣・＠縺ｦ縺翫￥
-    const parser = (this.states as any)[key]?.parse;
-    return parser ? parser(raw) : raw;
-  }
-}
-
-
---- D:\Projects\simpleAVmanager\lib\devices\deviceTemplate.ts ---
-
-// lib/devices/deviceTemplate.ts
-import { TcpTask, UdpTask } from "../protocols";
-import type { AVDevice } from "../types";
-
-/**
- * 縲心TEP 1縲・莉ｻ諢・ 繝輔ぃ繧､繝ｫ蜀・□縺代〒菴ｿ縺・ｮ壽焚(霎樊嶌)繧貞ｮ夂ｾｩ縺励∪縺吶・ * translate縺ｨparseResponse縺ｮ髢薙〒譁・ｭ怜・縺ｮ謇薙■髢馴＆縺・繧ｿ繧､繝・繧帝亟縺舌・縺ｫ蠖ｹ遶九■縺ｾ縺吶・ */
-const States = {
-  ON: "on",
-  OFF: "off",
-  WARMING: "warming",
-  COOLING: "cooling",
-} as const;
-
-/**
- * 縲心TEP 2縲第ｩ滓攝蝗ｺ譛峨・迥ｶ諷・State)繧・ｼ墓焚縺ｮ蝙九ｒ螳夂ｾｩ縺励∪縺吶・ * 縺薙％縺ｫ譖ｸ縺・◆蜀・ｮｹ縺後√◎縺ｮ縺ｾ縺ｾ繝輔Ο繝ｳ繝医お繝ｳ繝・VanJS)縺ｧ縺ｮ陬懷ｮ悟呵｣懊↓縺ｪ繧翫∪縺吶・ */
-export type DeviceTemplateSchema = {
-  power?: typeof States.ON | typeof States.OFF | typeof States.WARMING | typeof States.COOLING;
-  input?: string;
-  volume?: number;
-  // 隗｣譫蝉ｸ崎ｦ√↑繧､繝吶Φ繝・繝懊ち繝ｳ遲・繧ゅ％縺薙↓蝙九ｒ譖ｸ縺・※縺翫￥縺ｨ縲《endUpdate譎ゅ↓陬懷ｮ後′蜉ｹ縺阪∪縺・  trigger_flash?: boolean;
 };
-
-/**
- * 縲心TEP 3縲代ョ繝舌う繧ｹ繧ｯ繝ｩ繧ｹ縺ｮ螳溯｣・ */
-export class DeviceTemplate implements AVDevice<DeviceTemplateSchema> {
-  // type縺ｯ讖滓攝縺斐→縺ｫ繝ｦ繝九・繧ｯ縺ｪ蜷榊燕繧偵▽縺代∝ｿ・★ 'as const' 繧剃ｻ倅ｸ弱＠縺ｦ縺上□縺輔＞縲・  // 縺薙ｌ縺ｫ繧医ｊ縲√ヵ繝ｭ繝ｳ繝医お繝ｳ繝峨〒縺薙・讖滓攝蝗ｺ譛峨・蝙九′閾ｪ蜍募愛蛻･縺輔ｌ繧九ｈ縺・↓縺ｪ繧翫∪縺吶・  public readonly type = "DeviceTemplate" as const;
-
-  /**
-   * 縲心TEP 4縲醍憾諷・States)縺ｮ螳夂ｾｩ - 逶｣隕悶・隗｣譫・parse)縺悟ｿ・ｦ√↑繧ゅ・
-   * satisfies繧ｭ繝ｼ繝ｯ繝ｼ繝峨ｒ菴ｿ縺・％縺ｨ縺ｧ縲｝arse髢｢謨ｰ縺ｮ譖ｸ縺榊ｿ倥ｌ繧探ypeScript縺後メ繧ｧ繝・け縺励※縺上ｌ縺ｾ縺吶・   */
-  private readonly states = {
-    power: {
-      // 逅・Φ(desired)縺ｮ迥ｶ諷九ｒ縲∝ｮ滓ｩ溘∈縺ｮ繧ｳ繝槭Φ繝画枚蟄怜・縺ｫ螟画鋤
-      translate: (v: any) => v === "?" ? "POWR ?\r" : (v === States.ON ? "POWR 1\r" : "POWR 0\r"),
-      // 螳滓ｩ溘°繧峨・逕溘・蠢懃ｭ・raw)繧偵ゞI逕ｨ縺ｮ蛟､縺ｫ螟画鋤縺励※霑斐☆
-      parse: (raw: string) => {
-        if (raw.includes("POWR=1")) return States.ON;
-        if (raw.includes("POWR=0")) return States.OFF;
-        if (raw.includes("POWR=2")) return States.COOLING;
-        if (raw.includes("POWR=3")) return States.WARMING;
-        return raw.trim();
-      }
-    },
-    volume: {
-      translate: (v: any) => v === "?" ? "VOLM ?\r" : `VOLM ${v}\r`,
-      parse: (raw: string) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
-    }
-  } satisfies Record<string, { translate: (v: any) => string; parse: (raw: string) => string }>;
-
-  /**
-   * 縲心TEP 5縲代う繝吶Φ繝・Events)縺ｮ螳夂ｾｩ - 騾∽ｿ｡縺ｮ縺ｿ縺ｧ縲∫憾諷九・隗｣譫・parse)縺御ｸ崎ｦ√↑繧ゅ・
-   */
-  private readonly events = {
-    trigger_flash: {
-      translate: (v: any) => "FLASH 1\r"
-    }
-  } satisfies Record<string, { translate: (v: any) => string }>;
-
-  /**
-   * 縲心TEP 6縲題・蜍慕函謌舌＆繧後ｋ迥ｶ諷九く繝ｼ繝ｪ繧ｹ繝・   * states縺ｮ繧ｭ繝ｼ(["power", "volume"])縺瑚・蜍輔〒蜈･繧翫∪縺吶よ焔蜍輔〒譖ｴ譁ｰ縺吶ｋ蠢・ｦ√・縺ゅｊ縺ｾ縺帙ｓ縲・   */
-  public readonly statusKeys = Object.keys(this.states);
-
-  /**
-   * 縲心TEP 7縲題ｨｱ螳ｹ迥ｶ諷・Tolerated States)縺ｮ險ｭ螳・   * 縲檎炊諠ｳ縺ｨ迴ｾ螳溘′螳悟・縺ｫ荳閾ｴ縺励※縺・↑縺上※繧ゅ√さ繝槭Φ繝峨・蜀埼√ｒ豁｢繧√※蠕・ｩ溘＠縺ｦ縺ｻ縺励＞縲榊ｴ蜷医↓螳夂ｾｩ縺励∪縺吶・   * 萓・ 髮ｻ貅唇N繧貞多縺倥◆蠕後∝ｮ滓ｩ溘′證匁ｩ滉ｸｭ(warming)縺ｧ縺ゅｌ縺ｰ縲√＞縺壹ｌON縺ｫ縺ｪ繧九・縺ｧ蜀埼√ｒ繧ｹ繧ｭ繝・・縺励∪縺吶・   */
-  public readonly toleratedStates: Record<string, Record<string, string[]>> = {
-    power: {
-      [States.ON]: [States.ON, States.WARMING],
-      [States.OFF]: [States.OFF, States.COOLING]
-    }
-  };
-
-  constructor(public id: string, public ip: string, public port = 8080) {}
-
-  /**
-   * 繝槭ロ繝ｼ繧ｸ繝｣繝ｼ縺九ｉ蜻ｼ縺ｰ繧後ｋ蜈ｱ騾壹・螟画鋤繝｡繧ｽ繝・ラ
-   */
-  translate(key: string, value: any) {
-    if (value === "?") {
-       // 蝠上＞蜷医ｏ縺帑ｸ榊庄縺ｮ讖滓攝(UDP遲・縺ｮ蝣ｴ蜷医・縲√％縺薙〒 null 繧定ｿ斐○縺ｰ繧ｹ繧ｭ繝・・縺輔ｌ縺ｾ縺・    }
-    const handler = (this.states as any)[key] || (this.events as any)[key];
-    const payload = handler?.translate(value);
-    
-    // 繝励Ο繝医さ繝ｫ縺ｫ蜷医ｏ縺帙※ TcpTask 縺・UdpTask 繧帝∈繧薙〒霑斐＠縺ｾ縺・    return payload ? new TcpTask(this.id, this.ip, this.port, String(payload)) : null;
-  }
-
-  /**
-   * 繝槭ロ繝ｼ繧ｸ繝｣繝ｼ縺九ｉ蜻ｼ縺ｰ繧後ｋ蜈ｱ騾壹・隗｣譫舌Γ繧ｽ繝・ラ
-   */
-  parseResponse(key: string, raw: string) {
-    const parser = (this.states as any)[key]?.parse;
-    return parser ? parser(raw) : raw.trim();
-  }
-}
 
 
 --- D:\Projects\simpleAVmanager\lib\devices\PjLinkDevice.ts ---
 
-import { TcpTask } from "../protocols";
-import type { AVDevice } from "../types";
+import type { DeviceDefinition } from "../factory";
 
-const PjState = { ON: "on", OFF: "off", WARMING: "warming", COOLING: "cooling" } as const;
+/**
+ * 1. 繝・ヰ繧､繧ｹ蝗ｺ譛峨・螳壽焚・亥錐蜑咲ｩｺ髢難ｼ峨ｒ荳縺､縺ｫ縺ｾ縺ｨ繧√ｋ
+ * as const 繧剃ｻ倥￠繧九％縺ｨ縺ｧ縲∵枚蟄怜・縺ｧ縺ｯ縺ｪ縺上後Μ繝・Λ繝ｫ蝙九阪→縺励※謇ｱ繧上ｌ縺ｾ縺吶・
+ */
+const PJ_CONST = {
+  power: {
+    ON: "on",
+    OFF: "off",
+    WARMING: "warming",
+    COOLING: "cooling",
+  },
+  shutter: {
+    OPEN: "open",
+    CLOSE: "close",
+  }
+} as const;
 
-//繝輔Ο繝ｳ繝医お繝ｳ繝峨↓蜈ｬ髢九☆繧九◆繧√・縲悟梛繧ｹ繧ｭ繝ｼ繝槭阪ｒ螳夂ｾｩ
+/**
+ * 2. 螳壽焚繧ｪ繝悶ず繧ｧ繧ｯ繝医°繧芽・蜍慕噪縺ｫ蝙九ｒ謚ｽ蜃ｺ縺吶ｋ
+ */
 export type PjLinkSchema = {
-  power?: typeof PjState.ON | typeof PjState.OFF | typeof PjState.WARMING | typeof PjState.COOLING;
-  input?: number;
+  power?: typeof PJ_CONST.power[keyof typeof PJ_CONST.power];
+  shutter?: typeof PJ_CONST.shutter[keyof typeof PJ_CONST.shutter];
   volume?: number;
-  volume_drag?: number;
 };
 
-export class PjLinkDevice implements AVDevice<PjLinkSchema> {
-  public readonly type = "PjLinkDevice" as const;
-
-  // ==========================================
-  // 1. 迥ｶ諷・(States): parse 縺後仙ｿ・医代↑繧ｰ繝ｫ繝ｼ繝・
-  // ==========================================
-  // satisfies Record<string, ...> 繧剃ｽｿ縺・％縺ｨ縺ｧ縲√継arse髢｢謨ｰ縺檎ｵｶ蟇ｾ蠢・ｦ√阪→TypeScript縺ｫ蠑ｷ蛻ｶ縺輔○縺ｾ縺・
-  private readonly states = {
+/**
+ * 4. 繝・ヰ繧､繧ｹ螳夂ｾｩ譛ｬ菴・
+ */
+export const pjLinkDef: DeviceDefinition<PjLinkSchema> = {
+  type: "PjLinkDevice",
+  protocol: "TCP",
+  defaultPort: 4352,
+  states: {
+    // --- 髮ｻ貅仙宛蠕｡ ---
     power: {
-      translate: (v: any) => v === "?" ? "%1POWR ?\r" : (v === PjState.ON ? "%1POWR 1\r" : "%1POWR 0\r"),
-      parse: (raw: string) => { // 竊・縺薙ｌ繧呈嶌縺榊ｿ倥ｌ繧九→繧ｨ繝・ぅ繧ｿ縺瑚ｵ､邱壹〒諤偵▲縺ｦ縺上ｌ縺ｾ縺呻ｼ・
-        if (raw.includes("POWR=0")) return PjState.OFF;
-        if (raw.includes("POWR=1")) return PjState.ON;
-        if (raw.includes("POWR=2")) return PjState.COOLING;
-        if (raw.includes("POWR=3")) return PjState.WARMING;
+      translate: (v) => v === "?" 
+        ? "%1POWR ?\r" 
+        : (v === PJ_CONST.power.ON ? "%1POWR 1\r" : "%1POWR 0\r"),
+      parse: (raw) => {
+        if (raw.includes("POWR=0")) return PJ_CONST.power.OFF;
+        if (raw.includes("POWR=1")) return PJ_CONST.power.ON;
+        if (raw.includes("POWR=2")) return PJ_CONST.power.COOLING;
+        if (raw.includes("POWR=3")) return PJ_CONST.power.WARMING;
         return raw.trim();
       }
     },
-    input: {
-      translate: (v: any) => v === "?" ? "%1INPT ?\r" : `%1INPT ${v}\r`,
-      parse: (raw: string) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
+    // --- 繧ｷ繝｣繝・ち繝ｼ蛻ｶ蠕｡ ---
+    shutter: {
+      translate: (v) => v === "?" 
+        ? "%1SHUT ?\r" 
+        : (v === PJ_CONST.shutter.OPEN ? "%1SHUT 0\r" : "%1SHUT 1\r"),
+      parse: (raw) => {
+        if (raw.includes("SHUT=10")) return PJ_CONST.shutter.OPEN; // 譏蜒乗ｶ亥悉隗｣髯､
+        if (raw.includes("SHUT=11")) return PJ_CONST.shutter.CLOSE; // 譏蜒乗ｶ亥悉
+        return raw.trim();
+      }
     },
+    // --- 髻ｳ驥丞宛蠕｡ ---
     volume: {
-      translate: (v: any) => v === "?" ? "%1VOLM ?\r" : `%1VOLM ${v}\r`,
-      parse: (raw: string) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
+      translate: (v) => v === "?" ? "%1VOLM ?\r" : `%1VOLM ${v}\r`,
+      parse: (raw) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
     }
-  } satisfies Record<string, { translate: (v: any) => string; parse: (raw: string) => string }>;
-
-  // ==========================================
-  // 2. 繧､繝吶Φ繝・(Events): parse 縺後蝉ｸ崎ｦ√代↑繧ｰ繝ｫ繝ｼ繝・
-  // ==========================================
-  private readonly events = {
-    volume_drag: {
-      translate: (v: any) => `%1VOLM ${v}\r`
-      // 縺薙％縺ｯ parse 繧呈嶌縺九↑縺上※繧よ偵ｉ繧後∪縺帙ｓ
-    }
-  } satisfies Record<string, { translate: (v: any) => string }>;
-
-  // ==========================================
-  // 笘・閾ｪ蜍慕函謌舌＆繧後ｋ statusKeys
-  // ==========================================
-  // 謇区嶌縺阪・驟榊・繧偵ｄ繧√※縲《tates縺ｮ繧ｭ繝ｼ荳隕ｧ・・"power", "input", "volume"]・峨ｒ蜍慕噪縺ｫ蜿門ｾ励＠縺ｾ縺吶・
-  // 縺薙ｌ縺ｧ驟榊・縺ｮ譖ｴ譁ｰ蠢倥ｌ繧・ち繧､繝昴′縲檎黄逅・噪縺ｫ荳榊庄閭ｽ縲阪↓縺ｪ繧翫∪縺吶・
-  public readonly statusKeys = Object.keys(this.states);
-
-  // ・郁ｨｱ螳ｹ迥ｶ諷九・螳夂ｾｩ縺ｯ縺昴・縺ｾ縺ｾ・・
-  public readonly toleratedStates: Record<string, Record<string, string[]>> = {
+  },
+  // 5. 逅・Φ縺ｨ迴ｾ螳溘・繧ｮ繝｣繝・・繧貞沂繧√ｋ螳夂ｾｩ
+  toleratedStates: {
     power: {
-      [PjState.ON]: [PjState.ON, PjState.WARMING],
-      [PjState.OFF]: [PjState.OFF, PjState.COOLING]
+      [PJ_CONST.power.ON]: [PJ_CONST.power.ON, PJ_CONST.power.WARMING],
+      [PJ_CONST.power.OFF]: [PJ_CONST.power.OFF, PJ_CONST.power.COOLING]
     }
-  };
-
-  constructor(public id: string, public ip: string, public port = 4352) {}
-
-  translate(key: string, value: any) {
-    // states 縺・events 縺ｮ縺ｩ縺｡繧峨°縺九ｉ謗｢縺励√≠繧後・ translate 繧貞ｮ溯｡・
-    const handler = (this.states as any)[key] || (this.events as any)[key];
-    const cmd = handler?.translate(value);
-    return cmd ? new TcpTask(this.id, this.ip, this.port, cmd) : null;
   }
-
-  parseResponse(key: string, raw: string) {
-    // parse 縺ｯ states 蛛ｴ縺ｫ縺励°蟄伜惠縺励↑縺・・縺ｧ縲∝ｮ牙・縺ｫ蜻ｼ縺ｳ蜃ｺ縺帙ｋ
-    const parser = (this.states as any)[key]?.parse;
-    return parser ? parser(raw) : raw.trim();
-  }
-}
+};
 
 
 --- D:\Projects\simpleAVmanager\ui\app.ts ---
