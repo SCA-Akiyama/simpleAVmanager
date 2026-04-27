@@ -1,60 +1,44 @@
-# ---
-
-**AV State Orchestrator (Project: "Desired vs Actual")**
+# AV State Orchestrator (Project: "Desired vs Actual")
 
 このプロジェクトは、**「理想（Desired）」と「現実（Actual）」の差分を埋める**という一貫した哲学に基づいた、Bun製のAV機器制御バックエンドシステムです。
 
-## **1\. コア・コンセプト**
+## **1. コア・コンセプト: Reconciliation (調停)**
 
-「電源をONにしたはずなのに、実機がなっていない」というAV現場の不安定さを解消するため、以下のループを回し続けます。
+AV機器の現場では「コマンドを送ったはずなのに動いていない」という不整合が頻発します。本システムはこれを解決するため、以下のループを回し続けます。
 
-* **Desired (理想)**: ユーザーが「こうあってほしい」と願う状態（DBに保存）。  
-* **Actual (現実)**: 30秒おきのポーリング（問い合わせ）で判明した実機の生の状態。  
-* **Reconciliation (調停)**: 理想と現実が異なれば、一致するまで命令を送り続ける。
+* **Desired (理想)**: ユーザーが「こうあってほしい」と願う状態（DB/メモリに保存）。
+* **Actual (現実)**: ポーリング（問い合わせ）によって判明した実機の生の状態。
+* **Reconciliation (調停)**: 理想と現実が異なれば、**一致するまで命令を送り続ける**。
+* **Tolerated States (許容状態)**: プロジェクターの暖機（Warming）のように「いずれ理想に到達する移行状態」を定義することで、機材への不要な連打を防ぎつつ、安全に待機します。
 
-## **2\. システム・アーキテクチャ**
+## **2. システム・アーキテクチャ**
 
-### **通信プロトコル (src/lib/protocols.ts)**
+### **バックエンド (Bun + SQLite)**
+* **Manager**: `isStateMet` 関数による宣言的な判定。機材固有のロジックをコアから排除し、高い汎用性を維持。
+* **Inventory**: 機材名簿。ここを更新するだけで、フロントエンドまでの型情報が自動的に同期されます。
+* **Protocols**: `TcpTask` / `UdpTask` による非同期通信の抽象化。
 
-* **TcpTask**: PJLink等で使用。命令送信だけでなく、実機からのレスポンスを string で返す機能を持ち、問い合わせ（Query）と命令（Set）を同一クラスで処理する。  
-* **UdpTask**: BrightSign等で使用。投げっぱなしの通信を担当。
+### **デバイス定義 (lib/devices/)**
+各機材を「状態（States）」と「イベント（Events）」に分離して定義します。
+* **States**: 解析（parse）が必須な監視対象。`statusKeys` はここから自動生成されます。
+* **Events**: 投げっぱなしのコマンド。再送制御の対象外。
+* **Type Safety**: 各デバイスが持つ `_schema` 型により、VS Code上での完璧な補完を実現。
 
-### **デバイス定義 (src/lib/devices/)**
+## **3. 開発者向けルール: 新しい機材の追加**
 
-各機材は「翻訳機」として動作します。
+機材を追加する際の手順は以下の通りです。
 
-* **translate(key, value)**: 値が ? なら問い合わせコマンド、それ以外なら設定コマンドを生成。  
-* **statusKeys**: 監視・保存・再送が必要な「状態」のリスト。これに含まれないキー（例: trigger）は「イベント」として扱い、再送は行わない。  
-* **parseResponse(key, raw)**: 実機からの生の返答を、UIで扱える値（on, off, warming, cooling 等）に変換。
+1.  `lib/devices/deviceTemplate.ts` をコピーして新しいファイルを作成。
+2.  `states` と `events` を埋める（`satisfies` により、parse関数の書き忘れはコンパイルエラーになります）。
+3.  必要に応じて `toleratedStates` で移行状態（Warming等）を定義。
+4.  `lib/inventory.ts` の `inventory` 配列に `new` して追加。
 
-### **マネージャー (src/lib/manager.ts)**
+**これにより、フロントエンドのコードを一行も書き換えることなく、UI開発時に新しい機材のキーが補完候補に出現するようになります。**
 
-システムの脳。
+## **4. 技術スタック**
 
-* **Fast Path**: ユーザー操作を受け取ると、即座にDB保存と実機送信を行う。  
-* **Slow Path**: 30秒おきに statusKeys に基づいて実機の状態を確認し、actualMap を更新。その後、理想とズレていれば再送。  
-* **判定ロジック**: on \!== warming であれば、愚直に命令を送り続ける。機材固有の事情（暖機運転など）をマネージャーが「忖度」しない、シンプルで堅牢な設計。
-
-## **3\. 技術スタック**
-
-* **Runtime**: Bun (Bun.connect, Bun.udpSocket による高速な通信)  
-* **Database**: SQLite (desired\_states テーブルによる状態の永続化)  
-* **Communication**: WebSocket (UIとのリアルタイムな同期)  
-* **Frontend**: サーバーサイドビルド（Bun.build）による軽量な配信
-
-## ---
-
-**4\. ファイル構成と役割**
-
-| ファイル名 | 役割 |
-| :---- | :---- |
-| main.ts | HTTP/WebSocketサーバー。定期同期（setInterval）の起点。 |
-| manager.ts | 状態管理の核心。SQLiteとメモリマップの同期、差分検知。 |
-| db.ts | SQLiteへの読み書き（INSERT OR REPLACEによる冪等性の確保）。 |
-| protocols.ts | TCP/UDP通信のプリミティブな実装。 |
-| inventory.ts | 管理対象デバイスの台帳。 |
-| PjLinkDevice.ts | PJLink規格（プロジェクター）のコマンド翻訳・応答解析。 |
-| BrightSignDevice.ts | UDPによるメディアプレーヤー制御。 |
-
-## ---
-
+* **Runtime**: Bun
+* **Database**: SQLite (desired_statesテーブルによる永続化)
+* **Communication**: WebSocket (リアルタイム同期)
+* **Frontend**: VanJS (軽量・リアクティブUI)
+* **Language**: TypeScript (End-to-Endの型安全)

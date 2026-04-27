@@ -1,0 +1,708 @@
+﻿
+
+--- D:\Projects\simpleAVmanager\main.ts ---
+
+import { deviceManager } from "./lib/manager";
+
+deviceManager.init();
+
+const server = Bun.serve({
+  port: 3000,
+  async fetch(req, server) {
+    const url = new URL(req.url);
+
+    // 1. WebSocket縺ｸ縺ｮ繧｢繝・・繧ｰ繝ｬ繝ｼ繝峨Μ繧ｯ繧ｨ繧ｹ繝医ｒ蜃ｦ逅・
+    if (url.pathname === "/ws") {
+      const success = server.upgrade(req);
+      if (success) return undefined; // Bun縺係S謗･邯壹∈蛻・ｊ譖ｿ縺医ｋ
+    }
+
+    // --- 莉･荳九∵里蟄倥・HTTP驟堺ｿ｡繝ｭ繧ｸ繝・け ---
+    if (url.pathname === "/") return new Response(Bun.file("index.html"));
+    if (url.pathname === "/pico.css") return new Response(Bun.file("node_modules/@picocss/pico/css/pico.min.css"));
+    
+    if (url.pathname === "/main.js") {
+      const build = await Bun.build({ entrypoints: ["./ui/app.ts"] });
+      return new Response(build.outputs[0]);
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+
+  // 2. WebSocket縺ｮ謖吝虚繧貞ｮ夂ｾｩ
+  websocket: {
+    open(ws) {
+      ws.subscribe("updates");
+      ws.send(JSON.stringify({ type: "INIT", data: deviceManager.getStatus() }));
+    },
+    async message(ws, msg) {
+      const { type, ids, patch, options } = JSON.parse(msg.toString());
+      if (type === "UPDATE") {
+        // options.immediateOnly 繧貞女縺大叙繧後ｋ繧医≧縺ｫ
+        await deviceManager.updateDesired(ids, patch, options);
+        server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
+      }
+    },
+  }
+});
+
+setInterval(() => {
+  deviceManager.syncAll().then(() => {
+    server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
+  });
+}, 10000);
+
+console.log(`噫 Server started at http://localhost:${server.port}`);
+
+
+--- D:\Projects\simpleAVmanager\lib\db.ts ---
+
+// src/lib/db.ts
+import { Database } from "bun:sqlite";
+
+// 繝輔ぃ繧､繝ｫ蜷阪ｒ "state.db" 縺ｨ縺励※菴懈・
+const db = new Database("state.db", { create: true });
+
+// 繝・・繝悶Ν菴懈・ (繝・ヰ繧､繧ｹID縲∬ｨｭ螳壹く繝ｼ縲∝､)
+db.run(`
+  CREATE TABLE IF NOT EXISTS desired_states (
+    device_id TEXT,
+    key TEXT,
+    value TEXT,
+    PRIMARY KEY (device_id, key)
+  )
+`);
+
+export const stateDb = {
+  // 縺吶∋縺ｦ縺ｮ縲檎炊諠ｳ縲阪ｒ隱ｭ縺ｿ霎ｼ繧
+  loadAll: () => {
+    const rows = db.query("SELECT * FROM desired_states").all() as any[];
+    return rows;
+  },
+
+  // 1縺､縺ｮ蛟､繧剃ｿ晏ｭ假ｼ医∪縺溘・譖ｴ譁ｰ・・
+  save: (deviceId: string, key: string, value: any) => {
+    const query = db.prepare(`
+      INSERT OR REPLACE INTO desired_states (device_id, key, value)
+      VALUES (?1, ?2, ?3)
+    `);
+    query.run(deviceId, key, JSON.stringify(value));
+  }
+};
+
+
+--- D:\Projects\simpleAVmanager\lib\inventory.ts ---
+
+// src/lib/inventory.ts
+import { PjLinkDevice } from "./devices/PjLinkDevice";
+import { BrightSignDevice } from "./devices/BrightSignDevice";
+
+// 莉雁ｾ後ｄ繧九％縺ｨ縺ｯ縲√％縺ｮ驟榊・縺ｫ讖滓攝繧・陦瑚ｶｳ縺吶％縺ｨ縺縺托ｼ・
+export const inventory = [
+  new PjLinkDevice("pj-01", "192.168.1.100"),
+  new BrightSignDevice("bs-01", "192.168.1.110"),
+] as const; // 笘・as const 繧剃ｻ倥￠繧九・縺後・繧､繝ｳ繝・
+
+// --- 縲蝉ｸ蠎ｦ縺縺第嶌縺城ｭ疲ｳ輔代％繧御ｻ･髯阪・莠悟ｺｦ縺ｨ隗ｦ繧峨↑縺上※OK ---
+export type FrontendDevice = typeof inventory[number] extends { 
+  id: infer I, 
+  type: infer T, 
+  // 繧ｯ繝ｩ繧ｹ蜀・・ _schema 縺九ｉ蝙九ｒ謚ｽ蜃ｺ・亥燕蝗樊署譯医・繝昴こ繝・ヨ・・
+  _schema?: infer S 
+} ? { 
+  id: I, 
+  type: T, 
+  desired: Partial<S>, 
+  actual: Partial<S> 
+} : never;
+
+
+--- D:\Projects\simpleAVmanager\lib\manager.ts ---
+
+import { inventory } from "./inventory";
+import { stateDb } from "./db";
+import type { AVDevice } from "./types";
+
+// 繝｡繝｢繝ｪ荳翫・迥ｶ諷狗ｮ｡逅・
+const desiredMap = new Map<string, any>();
+const actualMap = new Map<string, any>();
+
+// 迥ｶ諷九′貅縺溘＆繧後※縺・ｋ縺句愛螳壹☆繧狗ｴ皮ｲ矩未謨ｰ
+const isStateMet = (device: AVDevice, key: string, desired: any, actual: any): boolean => {
+  // device.toleratedStates 縺悟ｭ伜惠縺励↑縺・ｩ滓攝縺ｮ蝣ｴ蜷医・縲√％縺薙′ undefined 縺ｫ縺ｪ繧・
+  const tolerated = device.toleratedStates?.[key]?.[desired];
+  
+  if (tolerated && Array.isArray(tolerated)) {
+    return tolerated.includes(actual);
+  }
+  
+  // 險ｱ螳ｹ繝・・繧ｿ縺後↑縺・ｩ滓攝縺ｯ縲∽ｻ翫∪縺ｧ騾壹ｊ縺ｮ螳悟・荳閾ｴ縺ｧ蛻､螳夲ｼ医ヵ繧ｩ繝ｼ繝ｫ繝舌ャ繧ｯ・・
+  return desired === actual;
+};
+
+export const deviceManager = {
+  /**
+   * 襍ｷ蜍墓凾縺ｫSQLite縺九ｉ菫晏ｭ倥＆繧後◆縲檎炊諠ｳ縲阪・迥ｶ諷九ｒ蠕ｩ蜈・☆繧・
+   */
+  init: () => {
+    const savedStates = stateDb.loadAll();
+    savedStates.forEach(row => {
+      const current = desiredMap.get(row.device_id) || {};
+      desiredMap.set(row.device_id, { 
+        ...current, 
+        [row.key]: JSON.parse(row.value) 
+      });
+    });
+    console.log(`[DB] ${savedStates.length} 莉ｶ縺ｮ逅・Φ迥ｶ諷九ｒ蠕ｩ蜈・＠縺ｾ縺励◆縲Ａ);
+  },
+
+  /**
+   * 繝ｦ繝ｼ繧ｶ繝ｼ謫堺ｽ懊ｄAPI縺九ｉ縺ｮ縲檎炊諠ｳ縲阪・譖ｴ譁ｰ繧貞女縺台ｻ倥￠繧・(Fast Path縺ｮ襍ｷ轤ｹ)
+   */
+  updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
+    for (const id of ids) {
+      const next = { ...(desiredMap.get(id) || {}), ...patch };
+      desiredMap.set(id, next);
+
+      // 繧ｹ繝ｩ繧､繝繝ｼ謫堺ｽ懶ｼ・mmediateOnly・峨〒縺ｪ縺代ｌ縺ｰDB縺ｫ豌ｸ邯壼喧
+      if (!options.immediateOnly) {
+        Object.keys(patch).forEach(key => {
+          stateDb.save(id, key, patch[key]);
+        });
+      }
+    }
+    // 謫堺ｽ懊＠縺溘ョ繝舌う繧ｹ縺ｫ蟇ｾ縺励※蜊ｳ蠎ｧ縺ｫ蜷梧悄繧貞ｮ溯｡・(Fast Path)
+    await deviceManager.syncMany(ids, false, options.immediateOnly);
+  },
+
+  /**
+   * 隍・焚繝・ヰ繧､繧ｹ縺ｮ蜷梧悄繧剃ｸｦ蛻怜ｮ溯｡・
+   */
+  syncMany: async (ids: string[], isSlowPath: boolean, immediateOnly = false) => {
+    await Promise.all(ids.map(id => deviceManager.syncOne(id, isSlowPath, immediateOnly)));
+  },
+
+  /**
+   * 1蜿ｰ縺ｮ繝・ヰ繧､繧ｹ縺ｫ蟇ｾ縺吶ｋ蜷梧悄繝ｭ繧ｸ繝・け縺ｮ譬ｸ蠢・
+   */
+  syncOne: async (id: string, isSlowPath: boolean, immediateOnly = false) => {
+    const device = inventory.find(d => d.id === id) as AVDevice | undefined;
+    if (!device) return;
+
+    const statusKeys = device.statusKeys || [];
+
+    // 1. 迴ｾ螳・Actual)縺ｮ譖ｴ譁ｰ (Slow Path譎・
+    if (isSlowPath) {
+      for (const key of statusKeys) {
+        const task = device.translate(key, "?");
+        if (!task) continue; // BrightSign縺ｪ縺ｩ縺ｮ縲悟撫縺・↓遲斐∴繧峨ｌ縺ｪ縺・ｩ滓攝縲阪・繧ｹ繧ｭ繝・・縺輔ｌ繧・
+        try {
+          const raw = await task.execute();
+          if (raw) {
+            const val = device.parseResponse(key, raw);
+            actualMap.set(id, { ...(actualMap.get(id) || {}), [key]: val });
+          }
+        } catch (e) { console.warn(`[Query Failed] ${id}:${key}`); }
+      }
+    }
+
+    // 2. 蟾ｮ蛻・・蜷梧悄
+    const desired = desiredMap.get(id) || {};
+    const actual = actualMap.get(id) || {};
+    
+    for (const key of Object.keys(desired)) {
+      const isStatus = statusKeys.includes(key);
+
+      // Slow Path譎ゅ・縲・vent・育憾諷九く繝ｼ莉･螟厄ｼ峨・蜀埼√・縺励↑縺・
+      if (isSlowPath && !isStatus) continue;
+
+      // 笘・､画峩・壼ｮ悟・荳閾ｴ・・==・峨°繧峨（sStateMet 髢｢謨ｰ縺ｧ縺ｮ蛻､螳壹↓鄂ｮ縺肴鋤縺・
+      // 縲仙､画峩蜑阪訴f (isStatus && desired[key] === actual[key]) continue;
+      // 縲仙､画峩蠕後・
+      if (isStatus && isStateMet(device, key, desired[key], actual[key])) continue;
+
+      const task = device.translate(key, desired[key]);
+      if (!task) continue;
+
+      try {
+        await task.execute();
+        
+        // 縲舌・繧､繝ｳ繝医薦vent縲√せ繝ｩ繧､繝繝ｼ謫堺ｽ懊√∪縺溘・縲悟撫縺・粋繧上○荳榊庄縺ｮ讖滓攝縲阪↑繧・
+        // 騾∽ｿ｡謌仙粥縺励◆迸ｬ髢薙↓ actual 繧呈峩譁ｰ縺吶ｋ (讌ｽ隕ｳ逧・峩譁ｰ)
+        const canQuery = device.translate(key, "?") !== null;
+        if (!isStatus || immediateOnly || !canQuery) {
+          actualMap.set(id, { ...(actualMap.get(id) || {}), [key]: desired[key] });
+        }
+      } catch (e: any) { console.error(`[Sync Failed] ${id}:${key}`); }
+    }
+  },
+
+  /**
+   * 蜈ｨ繝・ヰ繧､繧ｹ繧貞ｯｾ雎｡縺ｨ縺励◆螳壽悄蜷梧悄 (Slow Path)
+   */
+  syncAll: async () => {
+    const allIds = inventory.map(d => d.id);
+    await deviceManager.syncMany(allIds, true);
+  },
+
+  /**
+   * UI陦ｨ遉ｺ逕ｨ縺ｮ繝・・繧ｿ繧ｻ繝・ヨ繧貞叙蠕・
+   */
+  getStatus: () => inventory.map(d => ({
+    id: d.id,
+    desired: desiredMap.get(d.id) || {},
+    actual: actualMap.get(d.id) || {}
+  }))
+};
+
+
+--- D:\Projects\simpleAVmanager\lib\protocols.ts ---
+
+// src/lib/protocols.ts
+
+export interface ControlTask {
+  readonly deviceId: string;
+  execute(): Promise<string>;
+}
+
+// Bun繝阪う繝・ぅ繝悶↑TCP騾∽ｿ｡ (PJLink遲・
+export class TcpTask implements ControlTask {
+  constructor(
+    public readonly deviceId: string,
+    private ip: string,
+    private port: number,
+    private payload: string,
+    private timeout = 2000
+  ) {}
+
+  async execute(): Promise<string> { // 謌ｻ繧雁､縺ｮ蝙九ｒ螟画峩
+    return new Promise(async (resolve, reject) => {
+      let response = "";
+      console.log(`[TCP SEND] ${this.deviceId} (${this.ip}) >> ${this.payload.trim()}`);
+
+      try {
+        const socket = await Bun.connect({
+          hostname: this.ip,
+          port: this.port,
+          socket: {
+            data(s, data) {
+              response += new TextDecoder().decode(data);
+              s.end(); 
+            },
+            close() { resolve(response); }, // response 繧定ｿ斐＠縺ｦ隗｣豎ｺ
+            error(s, err) { reject(err); }
+          }
+        });
+        socket.write(this.payload);
+        setTimeout(() => { socket.end(); resolve(response); }, this.timeout);
+      } catch (e) { reject(e); }
+    });
+  }
+}
+
+// Bun繝阪う繝・ぅ繝悶↑UDP騾∽ｿ｡ (BrightSign遲・
+const udpOut = await Bun.udpSocket({ port: 0 }); // 騾∽ｿ｡蟆ら畑
+
+export class UdpTask implements ControlTask {
+  constructor(
+    public readonly deviceId: string,
+    private ip: string,
+    private port: number,
+    private payload: string
+  ) {}
+
+  async execute(): Promise<string> {
+    udpOut.send(this.payload, this.port, this.ip);
+    return ""; // UDP縺ｯ霑比ｺ九′縺ｪ縺・・縺ｧ遨ｺ譁・ｭ励ｒ霑斐☆
+  }
+}
+
+
+--- D:\Projects\simpleAVmanager\lib\types.ts ---
+
+// src/lib/types.ts
+import type { ControlTask } from "./protocols";
+
+export interface AVDevice<TSchema = any> {
+  readonly id: string;
+  readonly type: string;
+  readonly statusKeys: readonly string[] | string[];
+  
+  // 繧ｪ繝励す繝ｧ繝翫Ν・医≠縺｣縺ｦ繧ゅ↑縺上※繧り憶縺・ｼ・
+  readonly toleratedStates?: Record<string, Record<string, string[]>>;
+
+  readonly _schema?: TSchema;
+
+  // 蠢・★螳溯｣・☆縺ｹ縺阪Γ繧ｽ繝・ラ
+  translate(key: string, value: any): ControlTask | null;
+  parseResponse(key: string, raw: string): any;
+}
+
+
+--- D:\Projects\simpleAVmanager\lib\devices\BrightSignDevice.ts ---
+
+// src/lib/devices/BrightSignDevice.ts
+import { UdpTask } from "../protocols";
+import type { AVDevice } from "../types";
+
+// 繝輔Ο繝ｳ繝医お繝ｳ繝峨・髢狗匱譎ゅ↓陬懷ｮ後＆繧後ｋ繧ｹ繧ｭ繝ｼ繝槫ｮ夂ｾｩ
+export type BrightSignSchema = {
+  // UDP讖滓攝縺ｯ蝓ｺ譛ｬ逧・↓荳譁ｹ騾夊｡後・縺溘ａ縲√％縺薙↓螳夂ｾｩ縺励◆繧ｭ繝ｼ縺ｯ縲後う繝吶Φ繝医阪→縺励※謇ｱ繧上ｌ縺ｾ縺・
+  power?: "on" | "off";
+  play?: string;
+  command?: string;
+};
+
+export class BrightSignDevice implements AVDevice<BrightSignSchema> {
+  // 譛譁ｰ縺ｮ隴伜挨繝ｫ繝ｼ繝ｫ: 繧ｯ繝ｩ繧ｹ蜷・+ as const
+  public readonly type = "BrightSignDevice" as const;
+
+  // ==========================================
+  // 1. 迥ｶ諷・(States): parse・郁ｧ｣譫撰ｼ峨′縲仙ｿ・医代↑繧ｰ繝ｫ繝ｼ繝・
+  // ==========================================
+  // BrightSign縺ｯUDP縺ｮ荳譁ｹ騾夊｡後〒迥ｶ諷句叙蠕励′縺ｧ縺阪↑縺・◆繧√√％縺薙↓縺ｯ菴輔ｂ螳夂ｾｩ縺励∪縺帙ｓ縲・
+  // 縺薙ｌ縺ｫ繧医ｊ statusKeys 縺ｯ閾ｪ蜍慕噪縺ｫ遨ｺ驟榊・ [] 縺ｫ縺ｪ繧翫∪縺吶・
+  private readonly states = {
+  } satisfies Record<string, { translate: (v: any) => string; parse: (raw: string) => string }>;
+
+  // ==========================================
+  // 2. 繧､繝吶Φ繝・(Events): parse 縺後蝉ｸ崎ｦ√代↑繧ｰ繝ｫ繝ｼ繝・
+  // ==========================================
+  private readonly events = {
+    power: {
+      translate: (v: any) => v === "on" ? "PowerOn" : "PowerOff" // 螳滓ｩ溘・繧ｳ繝槭Φ繝我ｻ墓ｧ倥↓蜷医ｏ縺帙ｋ
+    },
+    play: {
+      translate: (v: any) => `play:${v}`
+    },
+    command: {
+      translate: (v: any) => String(v)
+    }
+  } satisfies Record<string, { translate: (v: any) => string }>;
+
+  // states 縺ｮ繧ｭ繝ｼ縺九ｉ閾ｪ蜍慕函謌撰ｼ医％縺ｮ讖滓攝縺ｮ蝣ｴ蜷医・ [] 縺ｫ縺ｪ繧具ｼ・
+  public readonly statusKeys = Object.keys(this.states);
+
+  constructor(public id: string, public ip: string, public port = 5000) {}
+
+  translate(key: string, value: any) {
+    // 蝠上＞蜷医ｏ縺幢ｼ・・峨′譚･縺溷ｴ蜷医・UDP讖滓攝縺ｪ縺ｮ縺ｧ null 繧定ｿ斐＠縺ｦ繧ｹ繧ｭ繝・・縺輔○繧・[cite: 46]
+    if (value === "?") return null;
+
+    // states 縺・events 縺ｮ縺ｩ縺｡繧峨°縺九ｉ繝上Φ繝峨Λ繝ｼ繧呈爾縺・[cite: 63, 64]
+    const handler = (this.states as any)[key] || (this.events as any)[key];
+    const payload = handler?.translate(value);
+    
+    // UdpTask 縺ｨ縺励※逕滓・縺励※霑斐☆ [cite: 47]
+    return payload ? new UdpTask(this.id, this.ip, this.port, String(payload)) : null;
+  }
+
+  parseResponse(key: string, raw: string) {
+    // states 蛛ｴ縺ｫ螳夂ｾｩ縺後↑縺・ｩ滓攝・・DP讖滓攝・峨〒繧ゅ√・繝阪・繧ｸ繝｣繝ｼ縺九ｉ蜻ｼ縺ｰ繧後ｋ縺溘ａ螳溯｣・＠縺ｦ縺翫￥
+    const parser = (this.states as any)[key]?.parse;
+    return parser ? parser(raw) : raw;
+  }
+}
+
+
+--- D:\Projects\simpleAVmanager\lib\devices\deviceTemplate.ts ---
+
+// lib/devices/deviceTemplate.ts
+import { TcpTask, UdpTask } from "../protocols";
+import type { AVDevice } from "../types";
+
+/**
+ * 縲心TEP 1縲・莉ｻ諢・ 繝輔ぃ繧､繝ｫ蜀・□縺代〒菴ｿ縺・ｮ壽焚(霎樊嶌)繧貞ｮ夂ｾｩ縺励∪縺吶・ * translate縺ｨparseResponse縺ｮ髢薙〒譁・ｭ怜・縺ｮ謇薙■髢馴＆縺・繧ｿ繧､繝・繧帝亟縺舌・縺ｫ蠖ｹ遶九■縺ｾ縺吶・ */
+const States = {
+  ON: "on",
+  OFF: "off",
+  WARMING: "warming",
+  COOLING: "cooling",
+} as const;
+
+/**
+ * 縲心TEP 2縲第ｩ滓攝蝗ｺ譛峨・迥ｶ諷・State)繧・ｼ墓焚縺ｮ蝙九ｒ螳夂ｾｩ縺励∪縺吶・ * 縺薙％縺ｫ譖ｸ縺・◆蜀・ｮｹ縺後√◎縺ｮ縺ｾ縺ｾ繝輔Ο繝ｳ繝医お繝ｳ繝・VanJS)縺ｧ縺ｮ陬懷ｮ悟呵｣懊↓縺ｪ繧翫∪縺吶・ */
+export type DeviceTemplateSchema = {
+  power?: typeof States.ON | typeof States.OFF | typeof States.WARMING | typeof States.COOLING;
+  input?: string;
+  volume?: number;
+  // 隗｣譫蝉ｸ崎ｦ√↑繧､繝吶Φ繝・繝懊ち繝ｳ遲・繧ゅ％縺薙↓蝙九ｒ譖ｸ縺・※縺翫￥縺ｨ縲《endUpdate譎ゅ↓陬懷ｮ後′蜉ｹ縺阪∪縺・  trigger_flash?: boolean;
+};
+
+/**
+ * 縲心TEP 3縲代ョ繝舌う繧ｹ繧ｯ繝ｩ繧ｹ縺ｮ螳溯｣・ */
+export class DeviceTemplate implements AVDevice<DeviceTemplateSchema> {
+  // type縺ｯ讖滓攝縺斐→縺ｫ繝ｦ繝九・繧ｯ縺ｪ蜷榊燕繧偵▽縺代∝ｿ・★ 'as const' 繧剃ｻ倅ｸ弱＠縺ｦ縺上□縺輔＞縲・  // 縺薙ｌ縺ｫ繧医ｊ縲√ヵ繝ｭ繝ｳ繝医お繝ｳ繝峨〒縺薙・讖滓攝蝗ｺ譛峨・蝙九′閾ｪ蜍募愛蛻･縺輔ｌ繧九ｈ縺・↓縺ｪ繧翫∪縺吶・  public readonly type = "DeviceTemplate" as const;
+
+  /**
+   * 縲心TEP 4縲醍憾諷・States)縺ｮ螳夂ｾｩ - 逶｣隕悶・隗｣譫・parse)縺悟ｿ・ｦ√↑繧ゅ・
+   * satisfies繧ｭ繝ｼ繝ｯ繝ｼ繝峨ｒ菴ｿ縺・％縺ｨ縺ｧ縲｝arse髢｢謨ｰ縺ｮ譖ｸ縺榊ｿ倥ｌ繧探ypeScript縺後メ繧ｧ繝・け縺励※縺上ｌ縺ｾ縺吶・   */
+  private readonly states = {
+    power: {
+      // 逅・Φ(desired)縺ｮ迥ｶ諷九ｒ縲∝ｮ滓ｩ溘∈縺ｮ繧ｳ繝槭Φ繝画枚蟄怜・縺ｫ螟画鋤
+      translate: (v: any) => v === "?" ? "POWR ?\r" : (v === States.ON ? "POWR 1\r" : "POWR 0\r"),
+      // 螳滓ｩ溘°繧峨・逕溘・蠢懃ｭ・raw)繧偵ゞI逕ｨ縺ｮ蛟､縺ｫ螟画鋤縺励※霑斐☆
+      parse: (raw: string) => {
+        if (raw.includes("POWR=1")) return States.ON;
+        if (raw.includes("POWR=0")) return States.OFF;
+        if (raw.includes("POWR=2")) return States.COOLING;
+        if (raw.includes("POWR=3")) return States.WARMING;
+        return raw.trim();
+      }
+    },
+    volume: {
+      translate: (v: any) => v === "?" ? "VOLM ?\r" : `VOLM ${v}\r`,
+      parse: (raw: string) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
+    }
+  } satisfies Record<string, { translate: (v: any) => string; parse: (raw: string) => string }>;
+
+  /**
+   * 縲心TEP 5縲代う繝吶Φ繝・Events)縺ｮ螳夂ｾｩ - 騾∽ｿ｡縺ｮ縺ｿ縺ｧ縲∫憾諷九・隗｣譫・parse)縺御ｸ崎ｦ√↑繧ゅ・
+   */
+  private readonly events = {
+    trigger_flash: {
+      translate: (v: any) => "FLASH 1\r"
+    }
+  } satisfies Record<string, { translate: (v: any) => string }>;
+
+  /**
+   * 縲心TEP 6縲題・蜍慕函謌舌＆繧後ｋ迥ｶ諷九く繝ｼ繝ｪ繧ｹ繝・   * states縺ｮ繧ｭ繝ｼ(["power", "volume"])縺瑚・蜍輔〒蜈･繧翫∪縺吶よ焔蜍輔〒譖ｴ譁ｰ縺吶ｋ蠢・ｦ√・縺ゅｊ縺ｾ縺帙ｓ縲・   */
+  public readonly statusKeys = Object.keys(this.states);
+
+  /**
+   * 縲心TEP 7縲題ｨｱ螳ｹ迥ｶ諷・Tolerated States)縺ｮ險ｭ螳・   * 縲檎炊諠ｳ縺ｨ迴ｾ螳溘′螳悟・縺ｫ荳閾ｴ縺励※縺・↑縺上※繧ゅ√さ繝槭Φ繝峨・蜀埼√ｒ豁｢繧√※蠕・ｩ溘＠縺ｦ縺ｻ縺励＞縲榊ｴ蜷医↓螳夂ｾｩ縺励∪縺吶・   * 萓・ 髮ｻ貅唇N繧貞多縺倥◆蠕後∝ｮ滓ｩ溘′證匁ｩ滉ｸｭ(warming)縺ｧ縺ゅｌ縺ｰ縲√＞縺壹ｌON縺ｫ縺ｪ繧九・縺ｧ蜀埼√ｒ繧ｹ繧ｭ繝・・縺励∪縺吶・   */
+  public readonly toleratedStates: Record<string, Record<string, string[]>> = {
+    power: {
+      [States.ON]: [States.ON, States.WARMING],
+      [States.OFF]: [States.OFF, States.COOLING]
+    }
+  };
+
+  constructor(public id: string, public ip: string, public port = 8080) {}
+
+  /**
+   * 繝槭ロ繝ｼ繧ｸ繝｣繝ｼ縺九ｉ蜻ｼ縺ｰ繧後ｋ蜈ｱ騾壹・螟画鋤繝｡繧ｽ繝・ラ
+   */
+  translate(key: string, value: any) {
+    if (value === "?") {
+       // 蝠上＞蜷医ｏ縺帑ｸ榊庄縺ｮ讖滓攝(UDP遲・縺ｮ蝣ｴ蜷医・縲√％縺薙〒 null 繧定ｿ斐○縺ｰ繧ｹ繧ｭ繝・・縺輔ｌ縺ｾ縺・    }
+    const handler = (this.states as any)[key] || (this.events as any)[key];
+    const payload = handler?.translate(value);
+    
+    // 繝励Ο繝医さ繝ｫ縺ｫ蜷医ｏ縺帙※ TcpTask 縺・UdpTask 繧帝∈繧薙〒霑斐＠縺ｾ縺・    return payload ? new TcpTask(this.id, this.ip, this.port, String(payload)) : null;
+  }
+
+  /**
+   * 繝槭ロ繝ｼ繧ｸ繝｣繝ｼ縺九ｉ蜻ｼ縺ｰ繧後ｋ蜈ｱ騾壹・隗｣譫舌Γ繧ｽ繝・ラ
+   */
+  parseResponse(key: string, raw: string) {
+    const parser = (this.states as any)[key]?.parse;
+    return parser ? parser(raw) : raw.trim();
+  }
+}
+
+
+--- D:\Projects\simpleAVmanager\lib\devices\PjLinkDevice.ts ---
+
+import { TcpTask } from "../protocols";
+import type { AVDevice } from "../types";
+
+const PjState = { ON: "on", OFF: "off", WARMING: "warming", COOLING: "cooling" } as const;
+
+//繝輔Ο繝ｳ繝医お繝ｳ繝峨↓蜈ｬ髢九☆繧九◆繧√・縲悟梛繧ｹ繧ｭ繝ｼ繝槭阪ｒ螳夂ｾｩ
+export type PjLinkSchema = {
+  power?: typeof PjState.ON | typeof PjState.OFF | typeof PjState.WARMING | typeof PjState.COOLING;
+  input?: number;
+  volume?: number;
+  volume_drag?: number;
+};
+
+export class PjLinkDevice implements AVDevice<PjLinkSchema> {
+  public readonly type = "PjLinkDevice" as const;
+
+  // ==========================================
+  // 1. 迥ｶ諷・(States): parse 縺後仙ｿ・医代↑繧ｰ繝ｫ繝ｼ繝・
+  // ==========================================
+  // satisfies Record<string, ...> 繧剃ｽｿ縺・％縺ｨ縺ｧ縲√継arse髢｢謨ｰ縺檎ｵｶ蟇ｾ蠢・ｦ√阪→TypeScript縺ｫ蠑ｷ蛻ｶ縺輔○縺ｾ縺・
+  private readonly states = {
+    power: {
+      translate: (v: any) => v === "?" ? "%1POWR ?\r" : (v === PjState.ON ? "%1POWR 1\r" : "%1POWR 0\r"),
+      parse: (raw: string) => { // 竊・縺薙ｌ繧呈嶌縺榊ｿ倥ｌ繧九→繧ｨ繝・ぅ繧ｿ縺瑚ｵ､邱壹〒諤偵▲縺ｦ縺上ｌ縺ｾ縺呻ｼ・
+        if (raw.includes("POWR=0")) return PjState.OFF;
+        if (raw.includes("POWR=1")) return PjState.ON;
+        if (raw.includes("POWR=2")) return PjState.COOLING;
+        if (raw.includes("POWR=3")) return PjState.WARMING;
+        return raw.trim();
+      }
+    },
+    input: {
+      translate: (v: any) => v === "?" ? "%1INPT ?\r" : `%1INPT ${v}\r`,
+      parse: (raw: string) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
+    },
+    volume: {
+      translate: (v: any) => v === "?" ? "%1VOLM ?\r" : `%1VOLM ${v}\r`,
+      parse: (raw: string) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
+    }
+  } satisfies Record<string, { translate: (v: any) => string; parse: (raw: string) => string }>;
+
+  // ==========================================
+  // 2. 繧､繝吶Φ繝・(Events): parse 縺後蝉ｸ崎ｦ√代↑繧ｰ繝ｫ繝ｼ繝・
+  // ==========================================
+  private readonly events = {
+    volume_drag: {
+      translate: (v: any) => `%1VOLM ${v}\r`
+      // 縺薙％縺ｯ parse 繧呈嶌縺九↑縺上※繧よ偵ｉ繧後∪縺帙ｓ
+    }
+  } satisfies Record<string, { translate: (v: any) => string }>;
+
+  // ==========================================
+  // 笘・閾ｪ蜍慕函謌舌＆繧後ｋ statusKeys
+  // ==========================================
+  // 謇区嶌縺阪・驟榊・繧偵ｄ繧√※縲《tates縺ｮ繧ｭ繝ｼ荳隕ｧ・・"power", "input", "volume"]・峨ｒ蜍慕噪縺ｫ蜿門ｾ励＠縺ｾ縺吶・
+  // 縺薙ｌ縺ｧ驟榊・縺ｮ譖ｴ譁ｰ蠢倥ｌ繧・ち繧､繝昴′縲檎黄逅・噪縺ｫ荳榊庄閭ｽ縲阪↓縺ｪ繧翫∪縺吶・
+  public readonly statusKeys = Object.keys(this.states);
+
+  // ・郁ｨｱ螳ｹ迥ｶ諷九・螳夂ｾｩ縺ｯ縺昴・縺ｾ縺ｾ・・
+  public readonly toleratedStates: Record<string, Record<string, string[]>> = {
+    power: {
+      [PjState.ON]: [PjState.ON, PjState.WARMING],
+      [PjState.OFF]: [PjState.OFF, PjState.COOLING]
+    }
+  };
+
+  constructor(public id: string, public ip: string, public port = 4352) {}
+
+  translate(key: string, value: any) {
+    // states 縺・events 縺ｮ縺ｩ縺｡繧峨°縺九ｉ謗｢縺励√≠繧後・ translate 繧貞ｮ溯｡・
+    const handler = (this.states as any)[key] || (this.events as any)[key];
+    const cmd = handler?.translate(value);
+    return cmd ? new TcpTask(this.id, this.ip, this.port, cmd) : null;
+  }
+
+  parseResponse(key: string, raw: string) {
+    // parse 縺ｯ states 蛛ｴ縺ｫ縺励°蟄伜惠縺励↑縺・・縺ｧ縲∝ｮ牙・縺ｫ蜻ｼ縺ｳ蜃ｺ縺帙ｋ
+    const parser = (this.states as any)[key]?.parse;
+    return parser ? parser(raw) : raw.trim();
+  }
+}
+
+
+--- D:\Projects\simpleAVmanager\ui\app.ts ---
+
+// src/ui/app.ts
+import van from "vanjs-core";
+import { status } from "./store";
+import { tags } from "./tags";
+import { Dashboard } from "./pages/dashboard";
+
+export const App = () => {
+  return tags.main({ class: "container" },
+    tags.header(
+      tags.h1("Simple AV Manager"),
+      tags.p("繧ｹ繝・・繧ｿ繧ｹ: ", status)
+    ),
+    tags.article(
+      Dashboard()
+    )
+  );
+};
+
+van.add(document.body, App());
+
+
+--- D:\Projects\simpleAVmanager\ui\store.ts ---
+
+// src/ui/store.ts
+import van from "vanjs-core";
+import { reactive } from "vanjs-ext";
+
+// UI縺檎ｮ｡逅・☆繧句髪荳縺ｮ縲悟崋螳壹阪Μ繧ｹ繝・
+export const devices = reactive<any[]>([]);
+export const status = van.state("繧ｵ繝ｼ繝舌・謗･邯壻ｸｭ...");
+
+const socket = new WebSocket(`ws://${location.host}/ws`);
+
+socket.onmessage = (event) => {
+  try {
+    const msg = JSON.parse(event.data);
+    
+    // --- 1. 蛻晏屓謗･邯壽凾 (INIT): 繝ｪ繧ｹ繝医・譫邨・∩繧貞崋螳壹☆繧・---
+    if (msg.type === "INIT") {
+      devices.length = 0; // 蠢ｵ縺ｮ縺溘ａ繝ｪ繧ｻ繝・ヨ
+      msg.data.forEach((d: any) => {
+        // 繧ｪ繝悶ず繧ｧ繧ｯ繝亥・菴薙ｒ繝ｪ繧｢繧ｯ繝・ぅ繝悶↓縺励※霑ｽ蜉
+        devices.push(reactive(d));
+      });
+      status.val = "繧ｪ繝ｳ繝ｩ繧､繝ｳ";
+    }
+
+    // --- 2. 迥ｶ諷区峩譁ｰ譎・(SYNC): 荳ｭ霄ｫ縺ｮ蛟､・・esired/actual・峨□縺代ｒ譖ｸ縺肴鋤縺医ｋ ---
+    if (msg.type === "SYNC") {
+      msg.data.forEach((incoming: any) => {
+        const target = devices.find(d => d.id === incoming.id);
+        if (target) {
+          // 驥崎ｦ・ target 閾ｪ菴薙ｒ蟾ｮ縺玲崛縺医ｋ縺ｮ縺ｧ縺ｯ縺ｪ縺上∽ｸｭ霄ｫ縺ｮ繝励Ο繝代ユ繧｣繧呈峩譁ｰ縺吶ｋ
+          // 縺薙ｌ縺ｫ繧医ｊ縲．OM隕∫ｴ・・r・峨・菴懊ｊ逶ｴ縺励′逋ｺ逕溘＠縺ｪ縺上↑繧翫∪縺・
+          target.desired = incoming.desired;
+          target.actual = incoming.actual;
+        }
+      });
+    }
+  } catch (e) {
+    console.error("繝・・繧ｿ蜷梧悄繧ｨ繝ｩ繝ｼ:", e);
+  }
+};
+
+// 謫堺ｽ憺∽ｿ｡髢｢謨ｰ縺ｪ縺ｩ縺ｯ螟画峩縺ｪ縺・
+export const sendUpdate = (ids: string[], patch: any, immediate = false) => {
+  socket.send(JSON.stringify({ type: "UPDATE", ids, patch, options: { immediateOnly: immediate } }));
+};
+
+
+--- D:\Projects\simpleAVmanager\ui\tags.ts ---
+
+import van from "vanjs-core";
+
+// TypeScript縺梧ｨ呎ｺ悶〒謖√▲縺ｦ縺・ｋ蜈ｨHTML繧ｿ繧ｰ縺ｮ繝ｪ繧ｹ繝・(HTMLElementTagNameMap) 繧・
+// VanJS縺ｮ繧ｿ繧ｰ髢｢謨ｰ縺ｮ蝙九↓螟画鋤縺励∪縺・
+type VanTags = {
+  [K in keyof HTMLElementTagNameMap]: (...args: any[]) => HTMLElementTagNameMap[K];
+} & Record<string, (...args: any[]) => Element>;
+
+// 蜈ｨ縺ｦ縺ｮ繧ｿ繧ｰ縺悟・縺｣縺溘碁ｭ疲ｳ輔・繧ｪ繝悶ず繧ｧ繧ｯ繝医阪ｒ菴懊ｋ
+export const tags = van.tags as unknown as VanTags;
+
+
+--- D:\Projects\simpleAVmanager\ui\pages\dashboard.ts ---
+
+// src/ui/pages/dashboard.ts
+import { list } from "vanjs-ext";
+import { tags } from "../tags";
+import { devices, sendUpdate } from "../store";
+
+export const Dashboard = () => {
+  return tags.table({ class: "striped" },
+    tags.thead(
+      tags.tr(tags.th("繝・ヰ繧､繧ｹID"), tags.th("逅・Φ"), tags.th("迴ｾ螳・), tags.th("謫堺ｽ・))
+    ),
+    // list髢｢謨ｰ縺ｯ縲碁・蛻励・隕∫ｴ・・evice繧ｪ繝悶ず繧ｧ繧ｯ繝茨ｼ峨阪→DOM・・r・峨ｒ1蟇ｾ1縺ｧ邨舌・縺､縺代∪縺・
+    list(tags.tbody(), devices, (device) => 
+      tags.tr(
+        tags.td(device.val.id),
+        // () => 縺ｧ蝗ｲ繧縺薙→縺ｧ縲∽ｸｭ霄ｫ縺ｮ繝励Ο繝代ユ繧｣縺梧峩譁ｰ縺輔ｌ縺滓凾縺縺代％縺薙′譖ｸ縺肴鋤繧上ｊ縺ｾ縺・
+        tags.td(() => tags.span({ class: "badge" }, device.val.desired.power || "-")),
+        tags.td(() => tags.span({ class: "badge" }, device.val.actual.power || "-")),
+        tags.td(
+          tags.button({
+            onclick: () => sendUpdate([device.val.id], { power: "on" }),
+            class: "outline"
+          }, "ON"),
+          tags.button({
+            onclick: () => sendUpdate([device.val.id], { power: "off" }),
+            class: "outline secondary"
+          }, "OFF")
+        )
+      )
+    )
+  );
+};

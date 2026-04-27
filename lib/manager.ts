@@ -1,9 +1,23 @@
 import { inventory } from "./inventory";
 import { stateDb } from "./db";
+import type { AVDevice } from "./types";
 
 // メモリ上の状態管理
 const desiredMap = new Map<string, any>();
 const actualMap = new Map<string, any>();
+
+// 状態が満たされているか判定する純粋関数
+const isStateMet = (device: AVDevice, key: string, desired: any, actual: any): boolean => {
+  // device.toleratedStates が存在しない機材の場合は、ここが undefined になる
+  const tolerated = device.toleratedStates?.[key]?.[desired];
+  
+  if (tolerated && Array.isArray(tolerated)) {
+    return tolerated.includes(actual);
+  }
+  
+  // 許容データがない機材は、今まで通りの完全一致で判定（フォールバック）
+  return desired === actual;
+};
 
 export const deviceManager = {
   /**
@@ -51,7 +65,7 @@ export const deviceManager = {
    * 1台のデバイスに対する同期ロジックの核心
    */
   syncOne: async (id: string, isSlowPath: boolean, immediateOnly = false) => {
-    const device = inventory.find(d => d.id === id) as any;
+    const device = inventory.find(d => d.id === id) as AVDevice | undefined;
     if (!device) return;
 
     const statusKeys = device.statusKeys || [];
@@ -81,8 +95,10 @@ export const deviceManager = {
       // Slow Path時は、Event（状態キー以外）の再送はしない
       if (isSlowPath && !isStatus) continue;
 
-      // 状態が一致していればスキップ
-      if (isStatus && desired[key] === actual[key]) continue;
+      // ★変更：完全一致（===）から、isStateMet 関数での判定に置き換え
+      // 【変更前】if (isStatus && desired[key] === actual[key]) continue;
+      // 【変更後】
+      if (isStatus && isStateMet(device, key, desired[key], actual[key])) continue;
 
       const task = device.translate(key, desired[key]);
       if (!task) continue;
