@@ -3,8 +3,11 @@
 --- D:\Projects\simpleAVmanager\main.ts ---
 
 import { deviceManager } from "./lib/manager";
+import { initCronJobs } from "./lib/cron";
+import { handleClientMessage } from "./lib/ws-router";
 
 deviceManager.init();
+initCronJobs();
 
 const server = Bun.serve({
   port: 3000,
@@ -29,30 +32,214 @@ const server = Bun.serve({
     return new Response("Not Found", { status: 404 });
   },
 
-  // 2. WebSocket縺ｮ謖吝虚繧貞ｮ夂ｾｩ
   websocket: {
     open(ws) {
       ws.subscribe("updates");
       ws.send(JSON.stringify({ type: "INIT", data: deviceManager.getStatus() }));
     },
     async message(ws, msg) {
-      const { type, ids, patch, options } = JSON.parse(msg.toString());
-      if (type === "UPDATE") {
-        // options.immediateOnly 繧貞女縺大叙繧後ｋ繧医≧縺ｫ
-        await deviceManager.updateDesired(ids, patch, options);
+      // 蜈ｨ蜩｡縺ｸ縺ｮ荳譁蛾∽ｿ｡
+      const broadcastUpdate = () => {
         server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
-      }
+      };
+      
+      // 庁 縺薙・繧ｯ繝ｩ繧､繧｢繝ｳ繝医□縺代∈縺ｮ霑比ｿ｡
+      const sendResponse = (data: any) => {
+        ws.send(JSON.stringify(data));
+      };
+      
+      await handleClientMessage(msg.toString(), broadcastUpdate, sendResponse);
     },
   }
 });
 
-setInterval(() => {
-  deviceManager.syncAll().then(() => {
-    server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
-  });
-}, 10000);
+deviceManager.startPolling(() => {
+  server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
+});
 
 console.log(`噫 Server started at http://localhost:${server.port}`);
+
+
+--- D:\Projects\simpleAVmanager\test-device.ts ---
+
+// test-device.ts
+import { parseArgs } from "util";
+import { createDevice } from "./lib/factory";
+
+// 繝・せ繝医＠縺溘＞繝・ヰ繧､繧ｹ螳夂ｾｩ繧偵う繝ｳ繝昴・繝・
+import { pjLinkDef } from "./lib/devices/PjLinkDevice";
+import { brightSignDef } from "./lib/devices/BrightSignDevice";
+// import { templateDef } from "./lib/devices/_templateDevice";
+
+// CLI蠑墓焚縺ｮ繝代・繧ｹ
+const { values } = parseArgs({
+  args: Bun.argv,
+  options: {
+    ip: { type: "string" },
+    type: { type: "string" },
+    key: { type: "string", default: "power" },
+    val: { type: "string", default: "?" },
+  },
+  strict: true,
+  allowPositionals: true,
+});
+
+if (!values.ip || !values.type) {
+  console.error("笶・Usage: bun run test-device.ts --ip <IP_ADDRESS> --type <DEVICE_TYPE> [--key <STATE_KEY>] [--val <VALUE_OR_?>]");
+  console.error("庁 Example: bun run test-device.ts --ip 192.168.1.100 --type PjLinkDevice --key power --val ?");
+  process.exit(1);
+}
+
+// 逋ｻ骭ｲ縺輔ｌ縺ｦ縺・ｋ繝・ヰ繧､繧ｹ螳夂ｾｩ縺ｮ繝ｪ繧ｹ繝医°繧画､懃ｴ｢
+const definitions = [pjLinkDef, brightSignDef /*, templateDef */];
+const def = definitions.find(d => d.type === values.type);
+
+if (!def) {
+  console.error(`笶・Unknown device type: ${values.type}`);
+  process.exit(1);
+}
+
+console.log(`\n噫 Testing Device: ${def.type} at ${values.ip}:${def.defaultPort}`);
+console.log(`識 Target State : [${values.key}] -> ${values.val}`);
+console.log("-".repeat(50));
+
+// 繝・ヰ繧､繧ｹ繧､繝ｳ繧ｹ繧ｿ繝ｳ繧ｹ縺ｮ逕滓・
+const device = createDevice(def, { id: "test-id", ip: values.ip! });
+
+async function runTest() {
+  const task = device.translate(values.key!, values.val!);
+  
+  if (!task) {
+    console.error(`笶・No translation found for key: '${values.key}', value: '${values.val}'`);
+    return;
+  }
+
+  try {
+    console.log(`藤 Sending command...`);
+    const rawResponse = await task.execute();
+
+    if (rawResponse === null) {
+      console.log(`笨・Success (No response expected / UDP)`);
+      return;
+    }
+
+    console.log(`陶 Raw Response: ${JSON.stringify(rawResponse)}`);
+
+    if (device.checkError(rawResponse)) {
+      console.error(`笞・・Device reported an ERROR.`);
+    } else if (values.val === "?") {
+      const parsed = device.parseResponse(values.key!, rawResponse);
+      console.log(`ｧ Parsed State: ${parsed}`);
+    }
+
+  } catch (error: any) {
+    console.error(`笶・Network or Execution Error:`, error.message);
+  }
+}
+
+runTest();
+
+
+--- D:\Projects\simpleAVmanager\lib\cron.ts ---
+
+// src/lib/cron.ts
+import { deviceManager } from "./manager";
+import { scheduleDb } from "./db";
+
+/**
+ * 庁 螳壽悄繧ｸ繝ｧ繝悶・逋ｻ骭ｲ
+ */
+export const scheduleRecurring = (cronExp: string, ids: string[], patch: any, id: string = crypto.randomUUID()) => {
+  scheduleDb.add(id, "cron", cronExp, ids, patch);
+  
+  Bun.cron(cronExp, () => {
+    // 庁 螳牙・陬・ｽｮ: 逋ｺ轣ｫ縺励◆迸ｬ髢薙↓縲後∪縺DB縺ｫ蟄伜惠縺吶ｋ縺九阪ｒ遒ｺ隱阪☆繧・
+    const exists = scheduleDb.getAllCron().some((row: any) => row.id === id);
+    if (exists) {
+      deviceManager.updateDesired(ids, patch);
+    } else {
+      // 繝ｭ繧ｰ繧貞・縺励※縺ゅ￡繧九°縲・撕縺九↓辟｡隕悶☆繧九°縺ｯ縺雁･ｽ縺ｿ縺ｧ
+      // console.log(`遜 [莠｡髴翫ず繝ｧ繝門屓驕ｿ] 蜑企勁貂医∩縺ｮ螳壽悄繧ｸ繝ｧ繝悶・逋ｺ轣ｫ繧堤┌隕悶＠縺ｾ縺励◆: ${id}`);
+    }
+  });
+  console.log(`竢ｰ [螳壽悄逋ｻ骭ｲ] ${cronExp} -> ${ids.join(",")}`);
+};
+
+/**
+ * 庁 蜊倡匱繧ｸ繝ｧ繝悶・逋ｻ骭ｲ
+ */
+export const scheduleOnce = (date: Date, ids: string[], patch: any, id: string = crypto.randomUUID()) => {
+  const timeMs = date.getTime();
+  const now = Date.now();
+  if (timeMs <= now) return console.warn("笞・・驕主悉縺ｮ譌･譎ゅ・繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｫ縺ｧ縺阪∪縺帙ｓ");
+
+  scheduleDb.add(id, "once", timeMs.toString(), ids, patch);
+  console.log(`套 [蜊倡匱逋ｻ骭ｲ] ${date.toLocaleString()} -> ${ids.join(",")}`);
+
+  // 庁 縲占ｿｽ蜉縲第ｬ｡縺ｮ00遘・繝昴・繝ｪ繝ｳ繧ｰ)繧医ｊ繧ょ燕縺ｫ螳溯｡後☆縺ｹ縺咲峩霑代・繧ｸ繝ｧ繝悶↑繧峨√＞縺ｾ逶ｴ謗･繧ｿ繧､繝槭・繧剃ｻ墓寺縺代ｋ
+  const nextCronTime = Math.ceil(now / 60000) * 60000; 
+  if (timeMs < nextCronTime) {
+    setTimeout(() => {
+      // 螳牙・陬・ｽｮ・育匱轣ｫ譎ゅ↓DB縺ｫ縺ゅｋ縺狗｢ｺ隱搾ｼ・
+      if (scheduleDb.getAll().some((r: any) => r.id === id)) {
+        deviceManager.updateDesired(ids, patch);
+        scheduleDb.delete(id);
+      }
+    }, timeMs - now);
+  }
+};
+
+/**
+ * 庁 繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｩ繝ｼ縺ｮ蛻晄悄蛹悶→繝昴・繝ｪ繝ｳ繧ｰ
+ */
+export const initCronJobs = () => {
+  console.log("竢ｰ 繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｩ繝ｼ繧貞・譛溷喧 (螳悟・DB鬧・虚繝｢繝・Ν)");
+
+  // 1. 襍ｷ蜍墓凾・咼B縺九ｉ螳壽悄繧ｸ繝ｧ繝・cron)繧偵☆縺ｹ縺ｦ蠕ｩ蜈・
+  const cronJobs = scheduleDb.getAllCron();
+  cronJobs.forEach(row => {
+    const ids = JSON.parse(row.target_ids);
+    const patch = JSON.parse(row.patch);
+    Bun.cron(row.trigger, () => {
+      const exists = scheduleDb.getAllCron().some((r: any) => r.id === row.id);
+      if (exists) {
+        deviceManager.updateDesired(ids, patch);
+      }
+    });
+  });
+
+  // 2. 豈主・縺ｮ繝√ぉ繝・き繝ｼ・亥腰逋ｺ繧ｸ繝ｧ繝也畑・・
+  // 庁 繝｡繝｢繝ｪ荳翫・驟榊・縺ｯ荳蛻・ｮ｡逅・○縺壹∵ｯ主屓逶ｴ謗･DB縺ｫ縲御ｻ翫ｄ繧九∋縺堺ｻ穂ｺ九≠繧具ｼ溘阪→閨槭￥
+  Bun.cron("* * * * *", () => {
+    const now = Date.now();
+    const nextMinute = now + 60000;
+
+    // 驕主悉縺ｮ螳溯｡梧ｼ上ｌ・医し繝ｼ繝舌・蛛懈ｭ｢荳ｭ縺ｪ縺ｩ・峨ｂ蜷ｫ繧√※縲√％縺ｮ1蛻・ｻ･蜀・↓螳溯｡後☆縺ｹ縺阪ず繝ｧ繝悶ｒ蜿門ｾ・
+    const dueJobs = scheduleDb.getDueOnce(nextMinute);
+
+    dueJobs.forEach(row => {
+      const jobTime = parseInt(row.trigger, 10);
+      const ids = JSON.parse(row.target_ids);
+      const patch = JSON.parse(row.patch);
+
+      // 螳溯｡梧凾蛻ｻ縺ｾ縺ｧ縺ｮ繝・ぅ繝ｬ繧､繧定ｨ育ｮ暦ｼ磯℃蜴ｻ縺ｮ繧ｸ繝ｧ繝悶↑繧・0 縺ｫ縺ｪ繧雁叉譎ょｮ溯｡後＆繧後ｋ・・
+      const delay = Math.max(0, jobTime - now);
+
+      setTimeout(() => {
+        // 庁 鬲斐・60遘帝俣蟇ｾ遲・ 逋ｺ轣ｫ縺励◆迸ｬ髢薙↓縲後∪縺DB縺ｫ蟄伜惠縺吶ｋ縺九阪ｒ譛邨ら｢ｺ隱・
+        const stillExists = scheduleDb.getAll().some((r: any) => r.id === row.id);
+        
+        if (stillExists) {
+          deviceManager.updateDesired(ids, patch);
+          scheduleDb.delete(row.id); // 螳溯｡後′螳御ｺ・＠縺溽椪髢薙↓DB縺九ｉ豸医☆
+        } else {
+          // 蠕・ｩ滉ｸｭ縺ｫ繝ｦ繝ｼ繧ｶ繝ｼ縺ｫ繧医▲縺ｦ繧ｭ繝｣繝ｳ繧ｻ繝ｫ縺輔ｌ縺溷ｴ蜷医・菴輔ｂ縺励↑縺・
+          console.log(`尅 [繧ｭ繝｣繝ｳ繧ｻ繝ｫ讀懃衍] 蠕・ｩ滉ｸｭ縺ｫ蜑企勁縺輔ｌ縺溷腰逋ｺ繧ｸ繝ｧ繝悶・螳溯｡後ｒ蜿悶ｊ繧・ａ縺ｾ縺励◆: ${row.id}`);
+        }
+      }, delay);
+    });
+  });
+};
 
 
 --- D:\Projects\simpleAVmanager\lib\db.ts ---
@@ -90,22 +277,72 @@ export const stateDb = {
   }
 };
 
+db.run(`
+  CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    type TEXT,       -- 'once' 縺ｾ縺溘・ 'cron'
+    trigger TEXT,    -- 螳溯｡梧凾髢・繝溘Μ遘偵・譁・ｭ怜・) 縺ｾ縺溘・ Cron蠑・
+    target_ids TEXT, -- 謫堺ｽ懷ｯｾ雎｡縺ｮID驟榊・ (JSON)
+    patch TEXT       -- 謫堺ｽ懷・螳ｹ (JSON)
+  )
+`);
+
+export const scheduleDb = {
+  // 繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｫ縺ｮ霑ｽ蜉
+  add: (id: string, type: "once" | "cron", trigger: string, ids: string[], patch: any) => {
+    db.query(`INSERT OR REPLACE INTO schedules (id, type, trigger, target_ids, patch) VALUES (?1, ?2, ?3, ?4, ?5)`)
+      .run(id, type, trigger, JSON.stringify(ids), JSON.stringify(patch));
+  },
+  
+  // 繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｫ縺ｮ蜑企勁
+  delete: (id: string) => {
+    db.query("DELETE FROM schedules WHERE id = ?1").run(id);
+  },
+
+  // 縺吶∋縺ｦ縺ｮ螳壽悄繧ｸ繝ｧ繝悶ｒ蜿門ｾ・
+  getAllCron: () => {
+    return db.query("SELECT * FROM schedules WHERE type = 'cron'").all() as any[];
+  },
+
+  // 庁 謖・ｮ壹＠縺滓凾髢・繝溘Μ遘・縺ｾ縺ｧ縺ｫ螳溯｡後☆縺ｹ縺榊腰逋ｺ繧ｸ繝ｧ繝悶ｒ蜿門ｾ・
+  // CAST繧剃ｽｿ縺｣縺ｦ譁・ｭ怜・縺ｨ縺励※菫晏ｭ倥＆繧後◆繝溘Μ遘偵ｒ謨ｰ蛟､縺ｨ縺励※豈碑ｼ・＠縺ｾ縺・
+  getDueOnce: (targetTimeMs: number) => {
+    return db.query("SELECT * FROM schedules WHERE type = 'once' AND CAST(trigger AS INTEGER) <= ?1").all(targetTimeMs) as any[];
+  },
+
+  getRange: (startMs: number, endMs: number) => {
+    return db.query(`
+      SELECT * FROM schedules 
+      WHERE type = 'cron' 
+      OR (type = 'once' AND CAST(trigger AS INTEGER) BETWEEN ?1 AND ?2)
+    `).all(startMs, endMs) as any[];
+  },
+
+  getAll: () => {
+    return db.query("SELECT * FROM schedules").all() as any[];
+  }
+};
+
 
 --- D:\Projects\simpleAVmanager\lib\factory.ts ---
 
 // src/lib/factory.ts
 import { TaskFactory, type ProtocolType } from "./protocols";
 import type { AVDevice } from "./types";
+import type { z } from "zod";
 
 // 繝・ヰ繧､繧ｹ縺ｮ縲悟ｮ夂ｾｩ縲阪・蝙九ゆｽ懆・・縺薙ｌ縺縺代ｒ譖ｸ縺上・
 export interface DeviceDefinition<T = any> {
   readonly type: string;
+  readonly zodSchema?: z.ZodObject<any>;
   readonly protocol: ProtocolType;
   readonly defaultPort: number;
   readonly states: Record<string, {
     translate: (v: any) => string;
     parse: (raw: string) => any;
   }>;
+  readonly isError?: (raw: string) => boolean;
+  readonly ping?: { payload: string; protocol?: ProtocolType; };
   readonly events?: Record<string, {
     translate: (v: any) => string;
   }>;
@@ -124,8 +361,16 @@ export const createDevice = <T>(
   return {
     id: config.id,
     type: def.type,
+    zodSchema: def.zodSchema,
     // states 縺ｮ繧ｭ繝ｼ縺九ｉ閾ｪ蜍慕噪縺ｫ statusKeys 繧堤函謌・[cite: 51, 68, 83]
     statusKeys: Object.keys(def.states),
+    checkError(raw: string) {
+      return def.isError ? def.isError(raw) : false;
+    },
+    getPingTask() {
+      if (!def.ping) return null;
+      return TaskFactory.create(def.ping.protocol || def.protocol, { ...config, port, payload: def.ping.payload });
+    },
     toleratedStates: def.toleratedStates,
 
     _schema: undefined as T,
@@ -178,6 +423,10 @@ import type { AVDevice } from "./types";
 const desiredMap = new Map<string, any>();
 const actualMap = new Map<string, any>();
 
+const lastOperationMap = new Map<string, number>();
+// 繧ｯ繝ｼ繝ｫ繝繧ｦ繝ｳ譛滄俣・井ｾ・ 5000繝溘Μ遘・= 5遘抵ｼ・
+const COOLDOWN_MS = 5000;
+
 // 迥ｶ諷九′貅縺溘＆繧後※縺・ｋ縺句愛螳壹☆繧狗ｴ皮ｲ矩未謨ｰ
 const isStateMet = (device: AVDevice, key: string, desired: any, actual: any): boolean => {
   // device.toleratedStates 縺悟ｭ伜惠縺励↑縺・ｩ滓攝縺ｮ蝣ｴ蜷医・縲√％縺薙′ undefined 縺ｫ縺ｪ繧・
@@ -210,20 +459,63 @@ export const deviceManager = {
   /**
    * 繝ｦ繝ｼ繧ｶ繝ｼ謫堺ｽ懊ｄAPI縺九ｉ縺ｮ縲檎炊諠ｳ縲阪・譖ｴ譁ｰ繧貞女縺台ｻ倥￠繧・(Fast Path縺ｮ襍ｷ轤ｹ)
    */
-  updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
-    for (const id of ids) {
-      const next = { ...(desiredMap.get(id) || {}), ...patch };
-      desiredMap.set(id, next);
+updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
+    const now = Date.now();
 
-      // 繧ｹ繝ｩ繧､繝繝ｼ謫堺ｽ懶ｼ・mmediateOnly・峨〒縺ｪ縺代ｌ縺ｰDB縺ｫ豌ｸ邯壼喧
+    for (const id of ids) {
+      const device = inventory.find(d => d.id === id) as AVDevice | undefined;
+      if (!device) continue;
+
+      let safePatch = patch;
+
+      // 庁 Zod繧ｹ繧ｭ繝ｼ繝槭′螳夂ｾｩ縺輔ｌ縺ｦ縺・ｌ縺ｰ縲√ヰ繝ｪ繝・・繧ｷ繝ｧ繝ｳ縺ｨ繧ｵ繝九ち繧､繧ｺ繧貞ｮ溯｡・
+      if (device.zodSchema) {
+        // partial() 縺ｫ繧医ｊ縲∽ｸ驛ｨ縺ｮ繧ｭ繝ｼ縺縺代・譖ｴ譁ｰ繧りｨｱ蜿ｯ縺吶ｋ
+        const result = device.zodSchema.partial().safeParse(patch);
+        
+        if (!result.success) {
+          console.warn(`[Validation Error] ${id} 縺ｸ縺ｮ辟｡蜉ｹ縺ｪ謫堺ｽ懊ｒ繝悶Ο繝・け縺励∪縺励◆:`, result.error.issues);
+          continue; // 荳肴ｭ｣縺ｪ蛟､縺悟性縺ｾ繧後ｋ蝣ｴ蜷医・DB縺ｫ繧ゅΓ繝｢繝ｪ縺ｫ繧ょ渚譏縺輔○縺ｪ縺・
+        }
+        
+        safePatch = result.data; // 譛ｪ遏･縺ｮ繧ｭ繝ｼ(unknown_key遲・縺ｯ縺薙％縺ｧ閾ｪ蜍慕噪縺ｫ豸医∴繧・
+      }
+
+      // 遨ｺ縺ｮ繧ｪ繝悶ず繧ｧ繧ｯ繝医↓縺ｪ縺｣縺ｦ縺励∪縺｣縺溘ｉ繧ｹ繧ｭ繝・・
+      if (Object.keys(safePatch).length === 0) continue;
+
+      const next = { ...(desiredMap.get(id) || {}), ...safePatch };
+      desiredMap.set(id, next);
+      lastOperationMap.set(id, now);
+
       if (!options.immediateOnly) {
-        Object.keys(patch).forEach(key => {
-          stateDb.save(id, key, patch[key]);
+        // 螳牙・縺梧球菫昴＆繧後◆ safePatch 縺ｮ縺ｿ繧奪B縺ｫ譖ｸ縺崎ｾｼ繧
+        Object.keys(safePatch).forEach(key => {
+          stateDb.save(id, key, safePatch[key]);
         });
       }
     }
-    // 謫堺ｽ懊＠縺溘ョ繝舌う繧ｹ縺ｫ蟇ｾ縺励※蜊ｳ蠎ｧ縺ｫ蜷梧悄繧貞ｮ溯｡・(Fast Path)
+
     await deviceManager.syncMany(ids, false, options.immediateOnly);
+  },
+ 
+  startPolling: (onSyncFinished?: () => void) => {
+    // inventory 縺ｫ逋ｻ骭ｲ縺輔ｌ縺溘ョ繝舌う繧ｹ縺斐→縺ｫ迢ｬ遶九＠縺溘Ν繝ｼ繝励ｒ遶九■荳翫￡繧・
+    inventory.forEach(device => {
+      const runDeviceLoop = async () => {
+        // Slow Path 縺ｨ縺励※1蜿ｰ縺縺大酔譛・
+        await deviceManager.syncOne(device.id, true);
+        
+        // 蜷梧悄縺檎ｵゅｏ縺｣縺溘ｉ繧ｳ繝ｼ繝ｫ繝舌ャ繧ｯ繧堤匱轣ｫ・・I縺ｸ騾夂衍・・
+        if (onSyncFinished) onSyncFinished();
+        
+        // 縺昴・繝・ヰ繧､繧ｹ縺ｮ騾壻ｿ｡縺悟ｮ御ｺ・＠縺ｦ縺九ｉ10遘貞ｾ後↓谺｡縺ｮ繧ｵ繧､繧ｯ繝ｫ繧貞ｮ溯｡・
+        setTimeout(runDeviceLoop, 10000);
+      };
+
+      // 蛻晏屓襍ｷ蜍・
+      runDeviceLoop();
+    });
   },
 
   /**
@@ -240,26 +532,59 @@ export const deviceManager = {
     const device = inventory.find(d => d.id === id) as AVDevice | undefined;
     if (!device) return;
 
+    const lastOpTime = lastOperationMap.get(id) || 0;
+    const isCoolingDown = (Date.now() - lastOpTime) < COOLDOWN_MS;
+
+    // Slow Path・亥ｮ壽悄逶｣隕厄ｼ峨・譎ゅ√け繝ｼ繝ｫ繝繧ｦ繝ｳ荳ｭ縺ｪ繧牙・逅・ｒ繧ｹ繧ｭ繝・・縺吶ｋ
+    if (isSlowPath && isCoolingDown) {
+      console.log(`[Cool Down] ${id} 縺ｯ謫堺ｽ懃峩蠕後・縺溘ａ逶｣隕悶ｒ繧ｹ繧ｭ繝・・縺励∪縺兪);
+      return; 
+    }
+
     const statusKeys = device.statusKeys || [];
+    const actual = { ...(actualMap.get(id) || {}) };
+    const desired = desiredMap.get(id) || {};
+    
+    let networkError = false; // 繝阪ャ繝医Ρ繝ｼ繧ｯ螻､縺ｮ螟ｱ謨暦ｼ医ち繧､繝繧｢繧ｦ繝育ｭ会ｼ・
+    let controlError = false; // 繧｢繝励Μ繧ｱ繝ｼ繧ｷ繝ｧ繝ｳ螻､縺ｮ螟ｱ謨暦ｼ医さ繝槭Φ繝画拠蜷ｦ遲会ｼ・
 
     // 1. 迴ｾ螳・Actual)縺ｮ譖ｴ譁ｰ (Slow Path譎・
     if (isSlowPath) {
-      for (const key of statusKeys) {
-        const task = device.translate(key, "?");
-        if (!task) continue; // BrightSign縺ｪ縺ｩ縺ｮ縲悟撫縺・↓遲斐∴繧峨ｌ縺ｪ縺・ｩ滓攝縲阪・繧ｹ繧ｭ繝・・縺輔ｌ繧・
+      const pingTask = device.getPingTask();
+      if (pingTask) {
         try {
-          const raw = await task.execute();
-          if (raw) {
-            const val = device.parseResponse(key, raw);
-            actualMap.set(id, { ...(actualMap.get(id) || {}), [key]: val });
+          await pingTask.execute();
+        } catch (e) {
+          networkError = true; // Ping 螟ｱ謨・
+        }
+
+        await Bun.sleep(150);
+      }
+
+    for (const key of statusKeys) {
+      const task = device.translate(key, "?");
+      if (!task) continue;
+      try {
+        const raw = await task.execute();
+        
+        // 庁 null 莉･螟厄ｼ・CP縺ｪ縺ｩ縲∝ｿ懃ｭ斐′縺ゅ▲縺溷ｴ蜷茨ｼ峨・縺ｿ隧穂ｾ｡縺吶ｋ
+          if (raw !== null) {
+            if (device.checkError(raw)) {
+              console.warn(`[Device Error] ${id} reported error for query: ${key}`);
+              controlError = true;
+            } else {
+              actual[key] = device.parseResponse(key, raw);
+            }
           }
-        } catch (e) { console.warn(`[Query Failed] ${id}:${key}`); }
+        } catch (e) { 
+          console.warn(`[Query Failed] ${id}:${key}`);
+          networkError = true;
+        }
+        await Bun.sleep(150);
       }
     }
 
     // 2. 蟾ｮ蛻・・蜷梧悄
-    const desired = desiredMap.get(id) || {};
-    const actual = actualMap.get(id) || {};
     
     for (const key of Object.keys(desired)) {
       const isStatus = statusKeys.includes(key);
@@ -267,25 +592,37 @@ export const deviceManager = {
       // Slow Path譎ゅ・縲・vent・育憾諷九く繝ｼ莉･螟厄ｼ峨・蜀埼√・縺励↑縺・
       if (isSlowPath && !isStatus) continue;
 
-      // 笘・､画峩・壼ｮ悟・荳閾ｴ・・==・峨°繧峨（sStateMet 髢｢謨ｰ縺ｧ縺ｮ蛻､螳壹↓鄂ｮ縺肴鋤縺・
-      // 縲仙､画峩蜑阪訴f (isStatus && desired[key] === actual[key]) continue;
-      // 縲仙､画峩蠕後・
+      // isStateMet 髢｢謨ｰ縺ｧ縺ｮ蛻､螳壹↓鄂ｮ縺肴鋤縺・
       if (isStatus && isStateMet(device, key, desired[key], actual[key])) continue;
 
       const task = device.translate(key, desired[key]);
       if (!task) continue;
 
       try {
-        await task.execute();
+        const response = await task.execute();
         
-        // 縲舌・繧､繝ｳ繝医薦vent縲√せ繝ｩ繧､繝繝ｼ謫堺ｽ懊√∪縺溘・縲悟撫縺・粋繧上○荳榊庄縺ｮ讖滓攝縲阪↑繧・
-        // 騾∽ｿ｡謌仙粥縺励◆迸ｬ髢薙↓ actual 繧呈峩譁ｰ縺吶ｋ (讌ｽ隕ｳ逧・峩譁ｰ)
-        const canQuery = device.translate(key, "?") !== null;
-        if (!isStatus || immediateOnly || !canQuery) {
-          actualMap.set(id, { ...(actualMap.get(id) || {}), [key]: desired[key] });
+        // 庁 null 莉･螟悶〒縲√°縺､繧ｨ繝ｩ繝ｼ蛻､螳壹↓蠑輔▲縺九°縺｣縺溷ｴ蜷医・縺ｿ蠑ｾ縺・
+        if (response !== null && device.checkError(response)) {
+          console.error(`[Sync Rejected] ${id}:${key} -> ${response}`);
+          controlError = true;
+        } else {
+          // 謌仙粥譎ゑｼ・ull縺瑚ｿ斐▲縺ｦ縺阪◆UDP繧ゅ％縺薙ｒ騾壹ｋ・・
+          const canQuery = device.translate(key, "?") !== null;
+          if (!isStatus || immediateOnly || !canQuery) {
+            actual[key] = desired[key];
+          }
         }
-      } catch (e: any) { console.error(`[Sync Failed] ${id}:${key}`); }
+      } catch (e: any) { 
+        console.error(`[Sync Failed] ${id}:${key}`);
+        networkError = true;
+      }
     }
+
+    actualMap.set(id, { 
+      ...actual, 
+      _online: !networkError, // 繝阪ャ繝医Ρ繝ｼ繧ｯ騾壻ｿ｡縺御ｸ蠎ｦ縺ｧ繧ょ､ｱ謨励☆繧後・ false
+      _error: controlError    // 繝・ヰ繧､繧ｹ縺御ｸ蠎ｦ縺ｧ繧ゅお繝ｩ繝ｼ繧定ｿ斐○縺ｰ true
+    });
   },
 
   /**
@@ -299,11 +636,11 @@ export const deviceManager = {
   /**
    * UI陦ｨ遉ｺ逕ｨ縺ｮ繝・・繧ｿ繧ｻ繝・ヨ繧貞叙蠕・
    */
-  getStatus: () => inventory.map(d => ({
-    id: d.id,
-    desired: desiredMap.get(d.id) || {},
-    actual: actualMap.get(d.id) || {}
-  }))
+getStatus: () => inventory.map(d => ({
+  id: d.id,
+  desired: desiredMap.get(d.id) || {},
+  actual: actualMap.get(d.id) || { _online: false, _error: false } // 庁 蛻晄悄迥ｶ諷・
+}))
 };
 
 
@@ -313,10 +650,11 @@ export const deviceManager = {
 
 export interface ControlTask {
   readonly deviceId: string;
-  execute(): Promise<string>;
+// 庁 霑比ｿ｡繧呈悄蠕・＠縺ｪ縺・ｴ蜷茨ｼ・DP縺ｪ縺ｩ・峨・ null 繧定ｿ斐☆繧医≧縺ｫ螟画峩
+  execute(): Promise<string | null>;
 }
 
-// Bun繝阪う繝・ぅ繝悶↑TCP騾∽ｿ｡ (PJLink遲・
+// Bun繝阪う繝・ぅ繝悶↑TCP騾壻ｿ｡ (PJLink遲・
 export class TcpTask implements ControlTask {
   constructor(
     public readonly deviceId: string,
@@ -326,27 +664,58 @@ export class TcpTask implements ControlTask {
     private timeout = 2000
   ) {}
 
-  async execute(): Promise<string> { // 謌ｻ繧雁､縺ｮ蝙九ｒ螟画峩
-    return new Promise(async (resolve, reject) => {
+  execute(): Promise<string> { 
+    return new Promise((resolve, reject) => {
       let response = "";
+      let isTimedOut = false;
+      let socketRef: any = null;
+
       console.log(`[TCP SEND] ${this.deviceId} (${this.ip}) >> ${this.payload.trim()}`);
 
-      try {
-        const socket = await Bun.connect({
-          hostname: this.ip,
-          port: this.port,
-          socket: {
-            data(s, data) {
-              response += new TextDecoder().decode(data);
-              s.end(); 
-            },
-            close() { resolve(response); }, // response 繧定ｿ斐＠縺ｦ隗｣豎ｺ
-            error(s, err) { reject(err); }
+      // 1. 騾壻ｿ｡蜈ｨ菴難ｼ医ワ繝ｳ繝峨す繧ｧ繧､繧ｯ繧貞性繧・峨・繧ｿ繧､繝繧｢繧ｦ繝医ち繧､繝槭・繧呈怙蛻昴↓莉墓寺縺代ｋ
+      const timer = setTimeout(() => {
+        isTimedOut = true;
+        if (socketRef) socketRef.end(); // 縺吶〒縺ｫ繧ｽ繧ｱ繝・ヨ縺檎函謌舌＆繧後※縺・ｌ縺ｰ遐ｴ譽・
+        reject(new Error("TCP Connection/Read Timeout"));
+      }, this.timeout);
+
+      Bun.connect({
+        hostname: this.ip,
+        port: this.port,
+        socket: {
+          data(s, data) {
+            response += new TextDecoder().decode(data);
+            s.end(); // 蠢懃ｭ斐ｒ蜿励￠蜿悶▲縺溘ｉ蜊ｳ蛻・妙
+          },
+          close() { 
+            if (!isTimedOut) {
+              clearTimeout(timer);
+              resolve(response);
+            }
+          },
+          error(s, err) { 
+            if (!isTimedOut) {
+              clearTimeout(timer);
+              reject(err);
+            }
           }
-        });
+        }
+      }).then(socket => {
+        socketRef = socket;
+        
+        // 2. 繧ｿ繧､繝繧｢繧ｦ繝亥ｾ後↓郢九′縺｣縺ｦ縺励∪縺｣縺溷ｴ蜷医・繧ｴ繝ｼ繧ｹ繝医さ繝槭Φ繝蛾∽ｿ｡繧帝亟豁｢
+        if (isTimedOut) {
+          socket.end();
+          return;
+        }
+        
         socket.write(this.payload);
-        setTimeout(() => { socket.end(); resolve(response); }, this.timeout);
-      } catch (e) { reject(e); }
+      }).catch(err => {
+        if (!isTimedOut) {
+          clearTimeout(timer);
+          reject(err);
+        }
+      });
     });
   }
 }
@@ -362,14 +731,75 @@ export class UdpTask implements ControlTask {
     private payload: string
   ) {}
 
-  async execute(): Promise<string> {
+  async execute(): Promise<string | null> {
     udpOut.send(this.payload, this.port, this.ip);
-    return ""; // UDP縺ｯ霑比ｺ九′縺ｪ縺・・縺ｧ遨ｺ譁・ｭ励ｒ霑斐☆
+    // 庁 遨ｺ譁・ｭ励〒縺ｯ縺ｪ縺乗・遉ｺ逧・↓ null 繧定ｿ斐☆
+    return null; 
   }
 }
 
-export type ProtocolType = "TCP" | "UDP"; // 蟆・擂逧・↓ "HTTP" 繧・"SERIAL" 繧定ｿｽ蜉蜿ｯ閭ｽ
+// 庁 1. HTTP繧ｿ繧ｹ繧ｯ縺ｮ霑ｽ蜉
+export class HttpTask implements ControlTask {
+  constructor(
+    public readonly deviceId: string,
+    private ip: string,
+    private port: number,
+    private payload: string,
+    private timeout = 2000
+  ) {}
 
+  async execute(): Promise<string | null> {
+    // payload縺ｮ繝輔か繝ｼ繝槭ャ繝井ｾ・ 
+    // "GET /api/status" 
+    // "POST /api/power {\"state\":\"on\"}"
+    const parts = this.payload.trim().split(" ");
+    const method = ["GET", "POST", "PUT", "DELETE"].includes(parts[0] ?? "") ? parts[0] : "GET";
+    
+    // 繝｡繧ｽ繝・ラ縺檎怐逡･縺輔ｌ縺ｦ "/api/..." 縺九ｉ蟋九∪縺｣縺溷ｴ蜷医・ GET 縺ｨ縺ｿ縺ｪ縺・
+    const pathStr = method === "GET" && parts[0] !== "GET" ? parts[0] : parts[1];
+    const path = pathStr?.startsWith("/") ? pathStr : `/${pathStr || ""}`;
+    
+    // 谿九ｊ縺ｮ譁・ｭ怜・繧谷SON遲峨・繝懊ョ繧｣縺ｨ縺励※謇ｱ縺・
+    const body = parts.slice(2).join(" ") || undefined;
+
+    const url = `http://${this.ip}:${this.port}${path}`;
+    console.log(`[HTTP SEND] ${this.deviceId} >> ${method} ${url} ${body || ""}`);
+
+    // Bun縺ｮfetch縺ｯAbortController縺ｧ繧ｿ繧､繝繧｢繧ｦ繝医ｒ蛻ｶ蠕｡縺ｧ縺阪ｋ
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeout);
+
+    try {
+      const response = await fetch(url, {
+        method,
+        body,
+        signal: controller.signal,
+        headers: body ? { "Content-Type": "application/json" } : undefined
+      });
+
+      clearTimeout(timer);
+
+      if (!response.ok) {
+        // HTTP繧ｹ繝・・繧ｿ繧ｹ繧ｨ繝ｩ繝ｼ(404繧・00)縺ｯ縲‥evice.checkError縺ｧ蠑ｾ縺代ｋ繧医≧縺ｫ迚ｹ螳壹・繝輔か繝ｼ繝槭ャ繝医〒霑斐☆
+        return `HTTP_ERROR:${response.status}`;
+      }
+
+      // 繝ｬ繧ｹ繝昴Φ繧ｹ繝懊ョ繧｣繧偵ユ繧ｭ繧ｹ繝医→縺励※霑斐☆
+      return await response.text();
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (err.name === 'AbortError') {
+        throw new Error("HTTP Timeout");
+      }
+      throw err; // 繝阪ャ繝医Ρ繝ｼ繧ｯ繧ｨ繝ｩ繝ｼ縺ｨ縺励※荳翫・ catch 縺ｫ諡ｾ繧上○繧・
+    }
+  }
+}
+
+// 庁 2. 蝙九・霑ｽ蜉
+export type ProtocolType = "TCP" | "UDP" | "HTTP"; // "HTTP" 繧定ｿｽ蜉
+
+// 庁 3. 繝輔ぃ繧ｯ繝医Μ縺ｮ譖ｴ譁ｰ
 export const TaskFactory = {
   create: (
     protocol: ProtocolType,
@@ -380,6 +810,8 @@ export const TaskFactory = {
         return new TcpTask(config.id, config.ip, config.port, config.payload);
       case "UDP":
         return new UdpTask(config.id, config.ip, config.port, config.payload);
+      case "HTTP":
+        return new HttpTask(config.id, config.ip, config.port, config.payload); // 霑ｽ蜉
       default:
         throw new Error(`Unsupported protocol: ${protocol}`);
     }
@@ -390,17 +822,22 @@ export const TaskFactory = {
 --- D:\Projects\simpleAVmanager\lib\types.ts ---
 
 // src/lib/types.ts
+import type { z } from "zod";
 import type { ControlTask } from "./protocols";
 
 export interface AVDevice<TSchema = any> {
   readonly id: string;
   readonly type: string;
   readonly statusKeys: readonly string[] | string[];
+  readonly zodSchema?: z.ZodObject<any>;
   
   // 繧ｪ繝励す繝ｧ繝翫Ν・医≠縺｣縺ｦ繧ゅ↑縺上※繧り憶縺・ｼ・
   readonly toleratedStates?: Record<string, Record<string, string[]>>;
 
   readonly _schema?: TSchema;
+
+  checkError(raw: string): boolean;
+  getPingTask(): import("./protocols").ControlTask | null;
 
   // 蠢・★螳溯｣・☆縺ｹ縺阪Γ繧ｽ繝・ラ
   translate(key: string, value: any): ControlTask | null;
@@ -408,26 +845,146 @@ export interface AVDevice<TSchema = any> {
 }
 
 
---- D:\Projects\simpleAVmanager\lib\devices\BrightSignDevice.ts ---
+--- D:\Projects\simpleAVmanager\lib\ws-router.ts ---
 
-import type { DeviceDefinition } from "../factory"; // [cite: 12]
+// src/lib/ws-router.ts
+import { z } from "zod";
+import { deviceManager } from "./manager";
+import { scheduleDb } from "./db";
 
-export type BrightSignSchema = {
-  command?: string;
+// --- 繧ｹ繧ｭ繝ｼ繝槫ｮ夂ｾｩ ---
+
+const updateMessageSchema = z.object({
+  type: z.literal("UPDATE"),
+  ids: z.array(z.string()),
+  patch: z.record(z.string(), z.any()), 
+  options: z.object({ immediateOnly: z.boolean().default(false) }).default({ immediateOnly: false })
+});
+
+const addScheduleMessageSchema = z.object({
+  type: z.literal("ADD_SCHEDULE"),
+  scheduleType: z.enum(["once", "cron"]),
+  trigger: z.string(),
+  ids: z.array(z.string()),
+  patch: z.record(z.string(), z.any()),
+});
+
+const getSchedulesMessageSchema = z.object({
+  type: z.literal("GET_SCHEDULES"),
+  start: z.string().optional(), 
+  end: z.string().optional(),
+});
+
+// 庁 霑ｽ蜉: 蜑企勁逕ｨ繧ｹ繧ｭ繝ｼ繝・
+const deleteScheduleMessageSchema = z.object({
+  type: z.literal("DELETE_SCHEDULE"),
+  id: z.string(),
+});
+
+export const wsClientMessageSchema = z.discriminatedUnion("type", [
+  updateMessageSchema,
+  addScheduleMessageSchema,
+  getSchedulesMessageSchema,
+  deleteScheduleMessageSchema, // 庁 霑ｽ蜉
+]);
+
+// --- 繝ｫ繝ｼ繧ｿ繝ｼ譛ｬ菴・---
+
+export const handleClientMessage = async (
+  rawMessage: string, 
+  broadcastUpdate: () => void,
+  sendResponse: (data: any) => void 
+) => {
+  try {
+    const json = JSON.parse(rawMessage);
+    const result = wsClientMessageSchema.safeParse(json);
+
+    if (!result.success) {
+      console.warn("笞・・荳肴ｭ｣縺ｪ繝｡繝・そ繝ｼ繧ｸ:", result.error.issues);
+      return;
+    }
+
+    const msg = result.data;
+
+    switch (msg.type) {
+      case "UPDATE":
+        await deviceManager.updateDesired(msg.ids, msg.patch, msg.options);
+        broadcastUpdate();
+        break;
+
+      case "ADD_SCHEDULE":
+        const { scheduleOnce, scheduleRecurring } = await import("./cron");
+        if (msg.scheduleType === "once") {
+          scheduleOnce(new Date(msg.trigger), msg.ids, msg.patch);
+        } else {
+          scheduleRecurring(msg.trigger, msg.ids, msg.patch);
+        }
+        break;
+
+      case "GET_SCHEDULES":
+        let rows: any[];
+        if (msg.start && msg.end) {
+          const startMs = new Date(msg.start).getTime();
+          const endMs = new Date(msg.end).getTime();
+          rows = scheduleDb.getRange(startMs, endMs);
+        } else {
+          rows = scheduleDb.getAll();
+        }
+
+        const schedules = rows.map((row: any) => ({
+          id: row.id,
+          type: row.type,
+          trigger: row.trigger,
+          ids: JSON.parse(row.target_ids),
+          patch: JSON.parse(row.patch)
+        }));
+        
+        sendResponse({ type: "SCHEDULE_LIST", data: schedules });
+        break;
+
+      case "DELETE_SCHEDULE":
+        // 庁 繝・・繧ｿ繝吶・繧ｹ縺九ｉ蜑企勁
+        scheduleDb.delete(msg.id);
+        console.log(`卵・・[繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｫ蜑企勁] ID: ${msg.id}`);
+        // 蜑企勁螳御ｺ・ｒ騾夂衍
+        sendResponse({ type: "SCHEDULE_DELETED", id: msg.id });
+        break;
+    }
+  } catch (error) {
+    console.error("笶・Router Error:", error);
+  }
 };
 
+
+--- D:\Projects\simpleAVmanager\lib\devices\BrightSignDevice.ts ---
+
+import { z } from "zod";
+import type { DeviceDefinition } from "../factory";
+
+// 1. Zod縺ｧ繧ｹ繧ｭ繝ｼ繝槭ｒ螳夂ｾｩ
+// BrightSign縺ｫ騾√ｋ蜿ｯ閭ｽ諤ｧ縺ｮ縺ゅｋ繧ｳ繝槭Φ繝会ｼ井ｾ・ "play", "stop", "next" 縺ｪ縺ｩ・峨ｒ螳夂ｾｩ
+// 閾ｪ逕ｱ縺ｪ譁・ｭ怜・繧定ｨｱ蜿ｯ縺吶ｋ蝣ｴ蜷医・ z.string()縲∵ｱｺ縺ｾ縺｣縺溷腰隱槭↑繧・z.enum() 繧剃ｽｿ縺・∪縺・
+export const brightSignSchema = z.object({
+  command: z.string().optional(),
+});
+
+export type BrightSignSchema = z.infer<typeof brightSignSchema>;
+
+// 2. 繝・ヰ繧､繧ｹ螳夂ｾｩ譛ｬ菴・
 export const brightSignDef: DeviceDefinition<BrightSignSchema> = {
   type: "BrightSignDevice",
-  protocol: "UDP", // [cite: 58]
-  defaultPort: 5000, // [cite: 58]
+  protocol: "UDP", // [cite: 79]
+  defaultPort: 5000, // [cite: 79]
+  zodSchema: brightSignSchema, // 庁 繝槭ロ繝ｼ繧ｸ繝｣繝ｼ縺ｧ縺ｮ繝舌Μ繝・・繧ｷ繝ｧ繝ｳ逕ｨ縺ｫ逋ｻ骭ｲ
 
-  // BrightSign縺ｯ迥ｶ諷句叙蠕暦ｼ・uery・峨′縺ｧ縺阪↑縺・ｻ墓ｧ倥・縺溘ａ states 縺ｯ遨ｺ縺ｫ縺吶ｋ [cite: 58]
-  states: {},
+  // BrightSign縺ｯ迥ｶ諷句叙蠕暦ｼ・uery・峨′縺ｧ縺阪↑縺・ｻ墓ｧ倥・縺溘ａ ping 縺ｯ譛蟆城剞縺ｫ [cite: 79]
+  ping: { payload: "", protocol: "TCP" }, 
+  states: {}, // [cite: 79]
 
-  // 逋ｺ陦鯉ｼ・et・峨・縺ｿ縺ｮ繧ｳ繝槭Φ繝峨ｒ events 縺ｫ螳夂ｾｩ [cite: 59]
+  // 逋ｺ陦鯉ｼ・et・峨・縺ｿ縺ｮ謫堺ｽ懊ｒ events 縺ｫ螳夂ｾｩ [cite: 79]
   events: {
     command: {
-      translate: (v) => String(v)
+      translate: (v) => String(v) // [cite: 79]
     }
   }
 };
@@ -436,51 +993,38 @@ export const brightSignDef: DeviceDefinition<BrightSignSchema> = {
 --- D:\Projects\simpleAVmanager\lib\devices\PjLinkDevice.ts ---
 
 import type { DeviceDefinition } from "../factory";
+import { z } from "zod";
 
-/**
- * 1. 繝・ヰ繧､繧ｹ蝗ｺ譛峨・螳壽焚・亥錐蜑咲ｩｺ髢難ｼ峨ｒ荳縺､縺ｫ縺ｾ縺ｨ繧√ｋ
- * as const 繧剃ｻ倥￠繧九％縺ｨ縺ｧ縲∵枚蟄怜・縺ｧ縺ｯ縺ｪ縺上後Μ繝・Λ繝ｫ蝙九阪→縺励※謇ｱ繧上ｌ縺ｾ縺吶・
- */
-const PJ_CONST = {
-  power: {
-    ON: "on",
-    OFF: "off",
-    WARMING: "warming",
-    COOLING: "cooling",
-  },
-  shutter: {
-    OPEN: "open",
-    CLOSE: "close",
-  }
-} as const;
+// 1. Zod縺ｧ繧ｹ繧ｭ繝ｼ繝槭ｒ螳夂ｾｩ・亥ｮ壽焚繧ｪ繝悶ず繧ｧ繧ｯ繝医・蟒・ｭ｢縺励※逶ｴ謗･繝ｪ繝・Λ繝ｫ繧呈嶌縺擾ｼ・
+export const pjLinkSchema = z.object({
+  power: z.enum(["on", "off", "warming", "cooling"]),
+  shutter: z.enum(["open", "close"]),
+  volume: z.number().min(0).max(100) // 遽・峇謖・ｮ・
+});
 
-/**
- * 2. 螳壽焚繧ｪ繝悶ず繧ｧ繧ｯ繝医°繧芽・蜍慕噪縺ｫ蝙九ｒ謚ｽ蜃ｺ縺吶ｋ
- */
-export type PjLinkSchema = {
-  power?: typeof PJ_CONST.power[keyof typeof PJ_CONST.power];
-  shutter?: typeof PJ_CONST.shutter[keyof typeof PJ_CONST.shutter];
-  volume?: number;
-};
+export type PjLinkSchema = z.infer<typeof pjLinkSchema>;
 
-/**
- * 4. 繝・ヰ繧､繧ｹ螳夂ｾｩ譛ｬ菴・
- */
+// 2. 繝・ヰ繧､繧ｹ螳夂ｾｩ譛ｬ菴・
 export const pjLinkDef: DeviceDefinition<PjLinkSchema> = {
   type: "PjLinkDevice",
   protocol: "TCP",
   defaultPort: 4352,
+  zodSchema: pjLinkSchema, // 庁 縺薙％縺ｫ繧ｹ繧ｭ繝ｼ繝槭ｒ貂｡縺吶・繧貞ｿ倥ｌ縺壹↓・・
+  
+  isError: (raw) => raw.includes("ERR"),
+  ping: { payload: "\r" },
+  
   states: {
     // --- 髮ｻ貅仙宛蠕｡ ---
     power: {
       translate: (v) => v === "?" 
         ? "%1POWR ?\r" 
-        : (v === PJ_CONST.power.ON ? "%1POWR 1\r" : "%1POWR 0\r"),
+        : (v === "on" ? "%1POWR 1\r" : "%1POWR 0\r"),
       parse: (raw) => {
-        if (raw.includes("POWR=0")) return PJ_CONST.power.OFF;
-        if (raw.includes("POWR=1")) return PJ_CONST.power.ON;
-        if (raw.includes("POWR=2")) return PJ_CONST.power.COOLING;
-        if (raw.includes("POWR=3")) return PJ_CONST.power.WARMING;
+        if (raw.includes("POWR=0")) return "off";
+        if (raw.includes("POWR=1")) return "on";
+        if (raw.includes("POWR=2")) return "cooling";
+        if (raw.includes("POWR=3")) return "warming";
         return raw.trim();
       }
     },
@@ -488,10 +1032,10 @@ export const pjLinkDef: DeviceDefinition<PjLinkSchema> = {
     shutter: {
       translate: (v) => v === "?" 
         ? "%1SHUT ?\r" 
-        : (v === PJ_CONST.shutter.OPEN ? "%1SHUT 0\r" : "%1SHUT 1\r"),
+        : (v === "open" ? "%1SHUT 0\r" : "%1SHUT 1\r"),
       parse: (raw) => {
-        if (raw.includes("SHUT=10")) return PJ_CONST.shutter.OPEN; // 譏蜒乗ｶ亥悉隗｣髯､
-        if (raw.includes("SHUT=11")) return PJ_CONST.shutter.CLOSE; // 譏蜒乗ｶ亥悉
+        if (raw.includes("SHUT=10")) return "open"; // 譏蜒乗ｶ亥悉隗｣髯､
+        if (raw.includes("SHUT=11")) return "close"; // 譏蜒乗ｶ亥悉
         return raw.trim();
       }
     },
@@ -501,13 +1045,87 @@ export const pjLinkDef: DeviceDefinition<PjLinkSchema> = {
       parse: (raw) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
     }
   },
-  // 5. 逅・Φ縺ｨ迴ｾ螳溘・繧ｮ繝｣繝・・繧貞沂繧√ｋ螳夂ｾｩ
+  
+  // 3. 逅・Φ縺ｨ迴ｾ螳溘・繧ｮ繝｣繝・・繧貞沂繧√ｋ螳夂ｾｩ
   toleratedStates: {
     power: {
-      [PJ_CONST.power.ON]: [PJ_CONST.power.ON, PJ_CONST.power.WARMING],
-      [PJ_CONST.power.OFF]: [PJ_CONST.power.OFF, PJ_CONST.power.COOLING]
+      "on": ["on", "warming"],
+      "off": ["off", "cooling"]
     }
   }
+};
+
+
+--- D:\Projects\simpleAVmanager\lib\devices\_templateDevice.ts ---
+
+// src/lib/devices/_templateDevice.ts
+import { z } from "zod";
+import type { DeviceDefinition } from "../factory";
+
+/**
+ * 1. 迥ｶ諷九せ繧ｭ繝ｼ繝槭・螳夂ｾｩ
+ * 縺薙・讖滓攝縺ｧ謫堺ｽ懊・逶｣隕悶＠縺溘＞鬆・岼縺ｨ縲√◎縺ｮ蜿悶ｊ縺・ｋ蛟､繧・Zod 縺ｧ螳夂ｾｩ縺励∪縺吶・
+ * 萓・ 髮ｻ貅・on/off)縲∝・蜉帛・譖ｿ(hdmi1/hdmi2)縲・浹驥・0-100)縺ｪ縺ｩ
+ */
+export const templateSchema = z.object({
+  power: z.enum(["on", "off"]).optional(),
+  // input: z.enum(["hdmi1", "hdmi2"]).optional(),
+  // volume: z.number().min(0).max(100).optional(),
+});
+
+// 繧ｹ繧ｭ繝ｼ繝槭°繧欝ypeScript縺ｮ蝙九ｒ閾ｪ蜍慕函謌・
+export type TemplateSchema = z.infer<typeof templateSchema>;
+
+/**
+ * 2. 繝・ヰ繧､繧ｹ螳夂ｾｩ譛ｬ菴・
+ * Manager縺後％縺ｮ讖滓攝繧偵←縺・桶縺・°・磯壻ｿ｡譁ｹ蠑上√さ繝槭Φ繝峨・螟画鋤繝ｫ繝ｼ繝ｫ縺ｪ縺ｩ・峨ｒ螳夂ｾｩ縺励∪縺吶・
+ */
+export const templateDef: DeviceDefinition<TemplateSchema> = {
+  type: "TemplateDevice",  // 讖溷勣縺ｮ隴伜挨逕ｨ繧ｿ繧､繝怜錐・井ｸ諢上〒縺ゅｋ縺薙→・・
+  protocol: "TCP",         // "TCP" | "UDP" | "HTTP" 縺ｮ縺・★繧後°
+  defaultPort: 9999,       // 讖滓攝縺ｮ繝・ヵ繧ｩ繝ｫ繝医・繝ｼ繝育分蜿ｷ
+  zodSchema: templateSchema, // 繝舌Μ繝・・繧ｷ繝ｧ繝ｳ逕ｨ縺ｮ繧ｹ繧ｭ繝ｼ繝槭ｒ逋ｻ骭ｲ
+
+  // 縲舌が繝励す繝ｧ繝ｳ縲大ｮ壽悄逶｣隕厄ｼ・low Path・峨・逕溷ｭ倡｢ｺ隱咲畑繧ｳ繝槭Φ繝・
+  // ping: { payload: "?\r" },
+
+  // 縲舌が繝励す繝ｧ繝ｳ縲鷹壻ｿ｡邨先棡縺九ｉ繧ｨ繝ｩ繝ｼ繧貞愛螳壹☆繧九Ο繧ｸ繝・け
+  // isError: (raw) => raw.toUpperCase().includes("ERROR"),
+
+  /**
+   * 3. 迥ｶ諷・State)縺ｮ螟画鋤繝ｫ繝ｼ繝ｫ
+   * Manager縺ｮ縲檎炊諠ｳ(Desired)縲阪→讖滓攝縺ｮ縲檎樟螳・Actual)縲阪ｒ讖区ｸ｡縺励＠縺ｾ縺吶・
+   */
+  states: {
+    power: {
+      // 繧ｵ繝ｼ繝舌・縺九ｉ縺ｮ蛟､(v)繧偵∝ｮ滓ｩ溘∈騾√ｋ逕溘・繧ｳ繝槭Φ繝画枚蟄怜・縺ｫ螟画鋤縺励∪縺・
+      // v 縺・"?" 縺ｮ蝣ｴ蜷医・縲∫樟蝨ｨ縺ｮ迥ｶ諷九ｒ蝠上＞蜷医ｏ縺帙ｋ繧ｳ繝槭Φ繝峨ｒ霑斐＠縺ｾ縺・
+      translate: (v) => v === "?" ? "GET_POWER\r" : `SET_POWER ${v}\r`,
+      
+      // 螳滓ｩ溘°繧芽ｿ斐▲縺ｦ縺阪◆逕溘・譁・ｭ怜・(raw)繧定ｧ｣譫舌＠縲√せ繧ｭ繝ｼ繝槭〒螳夂ｾｩ縺励◆蛟､("on" | "off")縺ｫ螟画鋤縺励∪縺・
+      parse: (raw) => raw.includes("PWR=1") ? "on" : "off"
+    }
+  },
+
+  /**
+   * 4. 繧､繝吶Φ繝・Event)縺ｮ螟画鋤繝ｫ繝ｼ繝ｫ 縲舌が繝励す繝ｧ繝ｳ縲・
+   * 迴ｾ蝨ｨ縺ｮ迥ｶ諷九ｒ蝠上＞蜷医ｏ縺帙〒縺阪↑縺・碁√ｊ縺｣縺ｱ縺ｪ縺励阪・謫堺ｽ懶ｼ・DP縺ｪ縺ｩ・峨・縺薙■繧峨↓螳夂ｾｩ縺励∪縺吶・
+   */
+  // events: {
+  //   trigger: {
+  //     translate: (v) => `PLAY_FILE ${v}\r`
+  //   }
+  // },
+
+  /**
+   * 5. 險ｱ螳ｹ縺輔ｌ繧狗憾諷九・螳夂ｾｩ 縲舌が繝励す繝ｧ繝ｳ縲・
+   * 逅・Φ縺ｨ迴ｾ螳溘・繧ｺ繝ｬ繧剃ｸ譎ら噪縺ｫ險ｱ螳ｹ縺吶ｋ繝ｫ繝ｼ繝ｫ縺ｧ縺呻ｼ井ｾ具ｼ唹N繧呈欠遉ｺ縺励◆蠕後・縲係arming Up縲阪↑縺ｩ・峨・
+   */
+  // toleratedStates: {
+  //   power: {
+  //     "on": ["on", "warming"],
+  //   }
+  // }
 };
 
 

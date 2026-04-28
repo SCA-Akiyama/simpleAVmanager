@@ -1,16 +1,20 @@
 // src/lib/factory.ts
 import { TaskFactory, type ProtocolType } from "./protocols";
 import type { AVDevice } from "./types";
+import type { z } from "zod";
 
 // デバイスの「定義」の型。作者はこれだけを書く。
 export interface DeviceDefinition<T = any> {
   readonly type: string;
+  readonly zodSchema?: z.ZodObject<any>;
   readonly protocol: ProtocolType;
   readonly defaultPort: number;
   readonly states: Record<string, {
     translate: (v: any) => string;
     parse: (raw: string) => any;
   }>;
+  readonly isError?: (raw: string) => boolean;
+  readonly ping?: { payload: string; protocol?: ProtocolType; };
   readonly events?: Record<string, {
     translate: (v: any) => string;
   }>;
@@ -29,8 +33,16 @@ export const createDevice = <T>(
   return {
     id: config.id,
     type: def.type,
+    zodSchema: def.zodSchema,
     // states のキーから自動的に statusKeys を生成 [cite: 51, 68, 83]
     statusKeys: Object.keys(def.states),
+    checkError(raw: string) {
+      return def.isError ? def.isError(raw) : false;
+    },
+    getPingTask() {
+      if (!def.ping) return null;
+      return TaskFactory.create(def.ping.protocol || def.protocol, { ...config, port, payload: def.ping.payload });
+    },
     toleratedStates: def.toleratedStates,
 
     _schema: undefined as T,

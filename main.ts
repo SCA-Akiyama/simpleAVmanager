@@ -1,6 +1,9 @@
 import { deviceManager } from "./lib/manager";
+import { initCronJobs } from "./lib/cron";
+import { handleClientMessage } from "./lib/ws-router";
 
 deviceManager.init();
+initCronJobs();
 
 const server = Bun.serve({
   port: 3000,
@@ -25,29 +28,29 @@ const server = Bun.serve({
     return new Response("Not Found", { status: 404 });
   },
 
-  // 2. WebSocketの挙動を定義
   websocket: {
     open(ws) {
       ws.subscribe("updates");
       ws.send(JSON.stringify({ type: "INIT", data: deviceManager.getStatus() }));
     },
     async message(ws, msg) {
-      const { type, ids, patch, options } = JSON.parse(msg.toString());
-      if (type === "UPDATE") {
-        // options.immediateOnly を受け取れるように
-        await deviceManager.updateDesired(ids, patch, options);
+      // 全員への一斉送信
+      const broadcastUpdate = () => {
         server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
-      }
+      };
+      
+      // 💡 このクライアントだけへの返信
+      const sendResponse = (data: any) => {
+        ws.send(JSON.stringify(data));
+      };
+      
+      await handleClientMessage(msg.toString(), broadcastUpdate, sendResponse);
     },
   }
 });
 
-const runSyncLoop = async () => {
-  await deviceManager.syncAll();
-  // 同期が終わってから10秒待って、次を実行する
+deviceManager.startPolling(() => {
   server.publish("updates", JSON.stringify({ type: "SYNC", data: deviceManager.getStatus() }));
-  setTimeout(runSyncLoop, 10000);
-};
+});
 
-runSyncLoop();
 console.log(`🚀 Server started at http://localhost:${server.port}`);

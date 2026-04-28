@@ -6,6 +6,10 @@ import type { AVDevice } from "./types";
 const desiredMap = new Map<string, any>();
 const actualMap = new Map<string, any>();
 
+const lastOperationMap = new Map<string, number>();
+// クールダウン期間（例: 5000ミリ秒 = 5秒）
+const COOLDOWN_MS = 5000;
+
 // 状態が満たされているか判定する純粋関数
 const isStateMet = (device: AVDevice, key: string, desired: any, actual: any): boolean => {
   // device.toleratedStates が存在しない機材の場合は、ここが undefined になる
@@ -38,20 +42,63 @@ export const deviceManager = {
   /**
    * ユーザー操作やAPIからの「理想」の更新を受け付ける (Fast Pathの起点)
    */
-  updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
-    for (const id of ids) {
-      const next = { ...(desiredMap.get(id) || {}), ...patch };
-      desiredMap.set(id, next);
+updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
+    const now = Date.now();
 
-      // スライダー操作（immediateOnly）でなければDBに永続化
+    for (const id of ids) {
+      const device = inventory.find(d => d.id === id) as AVDevice | undefined;
+      if (!device) continue;
+
+      let safePatch = patch;
+
+      // 💡 Zodスキーマが定義されていれば、バリデーションとサニタイズを実行
+      if (device.zodSchema) {
+        // partial() により、一部のキーだけの更新も許可する
+        const result = device.zodSchema.partial().safeParse(patch);
+        
+        if (!result.success) {
+          console.warn(`[Validation Error] ${id} への無効な操作をブロックしました:`, result.error.issues);
+          continue; // 不正な値が含まれる場合はDBにもメモリにも反映させない
+        }
+        
+        safePatch = result.data; // 未知のキー(unknown_key等)はここで自動的に消える
+      }
+
+      // 空のオブジェクトになってしまったらスキップ
+      if (Object.keys(safePatch).length === 0) continue;
+
+      const next = { ...(desiredMap.get(id) || {}), ...safePatch };
+      desiredMap.set(id, next);
+      lastOperationMap.set(id, now);
+
       if (!options.immediateOnly) {
-        Object.keys(patch).forEach(key => {
-          stateDb.save(id, key, patch[key]);
+        // 安全が担保された safePatch のみをDBに書き込む
+        Object.keys(safePatch).forEach(key => {
+          stateDb.save(id, key, safePatch[key]);
         });
       }
     }
-    // 操作したデバイスに対して即座に同期を実行 (Fast Path)
+
     await deviceManager.syncMany(ids, false, options.immediateOnly);
+  },
+ 
+  startPolling: (onSyncFinished?: () => void) => {
+    // inventory に登録されたデバイスごとに独立したループを立ち上げる
+    inventory.forEach(device => {
+      const runDeviceLoop = async () => {
+        // Slow Path として1台だけ同期
+        await deviceManager.syncOne(device.id, true);
+        
+        // 同期が終わったらコールバックを発火（UIへ通知）
+        if (onSyncFinished) onSyncFinished();
+        
+        // そのデバイスの通信が完了してから10秒後に次のサイクルを実行
+        setTimeout(runDeviceLoop, 10000);
+      };
+
+      // 初回起動
+      runDeviceLoop();
+    });
   },
 
   /**
@@ -68,26 +115,59 @@ export const deviceManager = {
     const device = inventory.find(d => d.id === id) as AVDevice | undefined;
     if (!device) return;
 
+    const lastOpTime = lastOperationMap.get(id) || 0;
+    const isCoolingDown = (Date.now() - lastOpTime) < COOLDOWN_MS;
+
+    // Slow Path（定期監視）の時、クールダウン中なら処理をスキップする
+    if (isSlowPath && isCoolingDown) {
+      console.log(`[Cool Down] ${id} は操作直後のため監視をスキップします`);
+      return; 
+    }
+
     const statusKeys = device.statusKeys || [];
+    const actual = { ...(actualMap.get(id) || {}) };
+    const desired = desiredMap.get(id) || {};
+    
+    let networkError = false; // ネットワーク層の失敗（タイムアウト等）
+    let controlError = false; // アプリケーション層の失敗（コマンド拒否等）
 
     // 1. 現実(Actual)の更新 (Slow Path時)
     if (isSlowPath) {
-      for (const key of statusKeys) {
-        const task = device.translate(key, "?");
-        if (!task) continue; // BrightSignなどの「問いに答えられない機材」はスキップされる
+      const pingTask = device.getPingTask();
+      if (pingTask) {
         try {
-          const raw = await task.execute();
-          if (raw) {
-            const val = device.parseResponse(key, raw);
-            actualMap.set(id, { ...(actualMap.get(id) || {}), [key]: val });
+          await pingTask.execute();
+        } catch (e) {
+          networkError = true; // Ping 失敗
+        }
+
+        await Bun.sleep(150);
+      }
+
+    for (const key of statusKeys) {
+      const task = device.translate(key, "?");
+      if (!task) continue;
+      try {
+        const raw = await task.execute();
+        
+        // 💡 null 以外（TCPなど、応答があった場合）のみ評価する
+          if (raw !== null) {
+            if (device.checkError(raw)) {
+              console.warn(`[Device Error] ${id} reported error for query: ${key}`);
+              controlError = true;
+            } else {
+              actual[key] = device.parseResponse(key, raw);
+            }
           }
-        } catch (e) { console.warn(`[Query Failed] ${id}:${key}`); }
+        } catch (e) { 
+          console.warn(`[Query Failed] ${id}:${key}`);
+          networkError = true;
+        }
+        await Bun.sleep(150);
       }
     }
 
     // 2. 差分の同期
-    const desired = desiredMap.get(id) || {};
-    const actual = actualMap.get(id) || {};
     
     for (const key of Object.keys(desired)) {
       const isStatus = statusKeys.includes(key);
@@ -95,25 +175,37 @@ export const deviceManager = {
       // Slow Path時は、Event（状態キー以外）の再送はしない
       if (isSlowPath && !isStatus) continue;
 
-      // ★変更：完全一致（===）から、isStateMet 関数での判定に置き換え
-      // 【変更前】if (isStatus && desired[key] === actual[key]) continue;
-      // 【変更後】
+      // isStateMet 関数での判定に置き換え
       if (isStatus && isStateMet(device, key, desired[key], actual[key])) continue;
 
       const task = device.translate(key, desired[key]);
       if (!task) continue;
 
       try {
-        await task.execute();
+        const response = await task.execute();
         
-        // 【ポイント】Event、スライダー操作、または「問い合わせ不可の機材」なら
-        // 送信成功した瞬間に actual を更新する (楽観的更新)
-        const canQuery = device.translate(key, "?") !== null;
-        if (!isStatus || immediateOnly || !canQuery) {
-          actualMap.set(id, { ...(actualMap.get(id) || {}), [key]: desired[key] });
+        // 💡 null 以外で、かつエラー判定に引っかかった場合のみ弾く
+        if (response !== null && device.checkError(response)) {
+          console.error(`[Sync Rejected] ${id}:${key} -> ${response}`);
+          controlError = true;
+        } else {
+          // 成功時（nullが返ってきたUDPもここを通る）
+          const canQuery = device.translate(key, "?") !== null;
+          if (!isStatus || immediateOnly || !canQuery) {
+            actual[key] = desired[key];
+          }
         }
-      } catch (e: any) { console.error(`[Sync Failed] ${id}:${key}`); }
+      } catch (e: any) { 
+        console.error(`[Sync Failed] ${id}:${key}`);
+        networkError = true;
+      }
     }
+
+    actualMap.set(id, { 
+      ...actual, 
+      _online: !networkError, // ネットワーク通信が一度でも失敗すれば false
+      _error: controlError    // デバイスが一度でもエラーを返せば true
+    });
   },
 
   /**
@@ -127,9 +219,9 @@ export const deviceManager = {
   /**
    * UI表示用のデータセットを取得
    */
-  getStatus: () => inventory.map(d => ({
-    id: d.id,
-    desired: desiredMap.get(d.id) || {},
-    actual: actualMap.get(d.id) || {}
-  }))
+getStatus: () => inventory.map(d => ({
+  id: d.id,
+  desired: desiredMap.get(d.id) || {},
+  actual: actualMap.get(d.id) || { _online: false, _error: false } // 💡 初期状態
+}))
 };

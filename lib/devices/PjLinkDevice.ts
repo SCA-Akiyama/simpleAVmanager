@@ -1,49 +1,36 @@
 import type { DeviceDefinition } from "../factory";
+import { z } from "zod";
 
-/**
- * 1. デバイス固有の定数（名前空間）を一つにまとめる
- * as const を付けることで、文字列ではなく「リテラル型」として扱われます。
- */
-const PJ_CONST = {
-  power: {
-    ON: "on",
-    OFF: "off",
-    WARMING: "warming",
-    COOLING: "cooling",
-  },
-  shutter: {
-    OPEN: "open",
-    CLOSE: "close",
-  }
-} as const;
+// 1. Zodでスキーマを定義（定数オブジェクトは廃止して直接リテラルを書く）
+export const pjLinkSchema = z.object({
+  power: z.enum(["on", "off", "warming", "cooling"]),
+  shutter: z.enum(["open", "close"]),
+  volume: z.number().min(0).max(100) // 範囲指定
+});
 
-/**
- * 2. 定数オブジェクトから自動的に型を抽出する
- */
-export type PjLinkSchema = {
-  power?: typeof PJ_CONST.power[keyof typeof PJ_CONST.power];
-  shutter?: typeof PJ_CONST.shutter[keyof typeof PJ_CONST.shutter];
-  volume?: number;
-};
+export type PjLinkSchema = z.infer<typeof pjLinkSchema>;
 
-/**
- * 4. デバイス定義本体
- */
+// 2. デバイス定義本体
 export const pjLinkDef: DeviceDefinition<PjLinkSchema> = {
   type: "PjLinkDevice",
   protocol: "TCP",
   defaultPort: 4352,
+  zodSchema: pjLinkSchema, // 💡 ここにスキーマを渡すのを忘れずに！
+  
+  isError: (raw) => raw.includes("ERR"),
+  ping: { payload: "\r" },
+  
   states: {
     // --- 電源制御 ---
     power: {
       translate: (v) => v === "?" 
         ? "%1POWR ?\r" 
-        : (v === PJ_CONST.power.ON ? "%1POWR 1\r" : "%1POWR 0\r"),
+        : (v === "on" ? "%1POWR 1\r" : "%1POWR 0\r"),
       parse: (raw) => {
-        if (raw.includes("POWR=0")) return PJ_CONST.power.OFF;
-        if (raw.includes("POWR=1")) return PJ_CONST.power.ON;
-        if (raw.includes("POWR=2")) return PJ_CONST.power.COOLING;
-        if (raw.includes("POWR=3")) return PJ_CONST.power.WARMING;
+        if (raw.includes("POWR=0")) return "off";
+        if (raw.includes("POWR=1")) return "on";
+        if (raw.includes("POWR=2")) return "cooling";
+        if (raw.includes("POWR=3")) return "warming";
         return raw.trim();
       }
     },
@@ -51,10 +38,10 @@ export const pjLinkDef: DeviceDefinition<PjLinkSchema> = {
     shutter: {
       translate: (v) => v === "?" 
         ? "%1SHUT ?\r" 
-        : (v === PJ_CONST.shutter.OPEN ? "%1SHUT 0\r" : "%1SHUT 1\r"),
+        : (v === "open" ? "%1SHUT 0\r" : "%1SHUT 1\r"),
       parse: (raw) => {
-        if (raw.includes("SHUT=10")) return PJ_CONST.shutter.OPEN; // 映像消去解除
-        if (raw.includes("SHUT=11")) return PJ_CONST.shutter.CLOSE; // 映像消去
+        if (raw.includes("SHUT=10")) return "open"; // 映像消去解除
+        if (raw.includes("SHUT=11")) return "close"; // 映像消去
         return raw.trim();
       }
     },
@@ -64,11 +51,12 @@ export const pjLinkDef: DeviceDefinition<PjLinkSchema> = {
       parse: (raw) => raw.match(/=(.*)/)?.[1]?.trim() || raw.trim()
     }
   },
-  // 5. 理想と現実のギャップを埋める定義
+  
+  // 3. 理想と現実のギャップを埋める定義
   toleratedStates: {
     power: {
-      [PJ_CONST.power.ON]: [PJ_CONST.power.ON, PJ_CONST.power.WARMING],
-      [PJ_CONST.power.OFF]: [PJ_CONST.power.OFF, PJ_CONST.power.COOLING]
+      "on": ["on", "warming"],
+      "off": ["off", "cooling"]
     }
   }
 };
