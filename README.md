@@ -1,90 +1,99 @@
-# Simple AV Manager
+# **simpleAVmanager**
 
-理想状態（Desired）と現実状態（Actual）を分離して管理する、堅牢かつ拡張性の高いAV機器マネージングツール・テンプレートです。
+simpleAVmanagerは、TypeScriptとBunを採用した、モダンで拡張性の高いAV機器・IoTデバイス管理フレームワークです 。
 
-## 核心的なコンセプト：Desired vs Actual
-本プロジェクトは、ネットワーク的に不安定なことが多いAV機器の制御において、「システムがどうあるべきか（Desired）」と「機器が今どうなっているか（Actual）」を厳格に分けて管理します。
+「理想状態（Desired）」と「現実状態（Actual）」を分離して管理するIoT Shadowパターンを採用しており、ネットワークの遅延や機器のハングアップに強い堅牢な制御を実現します 。また、Zodによる厳格なバリデーションと、フロントエンド向けの型定義自動生成機能により、安全かつ快適なEnd-to-Endの開発体験を提供します 。
 
-- **Fast Path (更新用)**: ユーザー操作により「理想」を即座に書き換え、機器へコマンドを送信します。
-- **Slow Path (監視用)**: 定期的（デフォルト10秒）に実機へ状態を問い合わせ、現実の状態を「理想」に同期、またはUIへフィードバックします。
+## **✨ 主な機能**
 
-## 主な特徴
+* **IoT Device Shadow パターン:** ユーザーからの操作（理想）を即座に受け付けつつ、バックグラウンドのポーリングで実際の機器状態と非同期に同期（Fast Path / Slow Path） 。
 
-### 1. デバイス定義の標準化（Factory Pattern）
-`factory.ts` による抽象化により、新しいデバイスの追加が非常に簡単です。ロジック（どう通信するか）ではなく、データ（どのコマンドを投げるか）の定義に集中できます。
-- **規律**: 誰が書いても同じ構造のデバイススクリプトになります。
-- **柔軟性**: TCP, UDP などのプロトコルを定義一つで切り替え可能です。
+* **マルチプロトコル対応:** TCP、UDP、HTTPでの機器制御をネイティブサポート。インターフェースが抽象化されており、プロトコルの追加も容易 。
 
-### 2. 型安全性（TypeScript + Schema）
-各デバイスの「状態」を `Schema` として定義することで、フロントエンドからバックエンドまで一貫した型補完が効きます。ボリュームの範囲や電源の列挙型など、IDEによる強力なサポートを受けながら開発できます。
+* **堅牢なスケジューラー:** SQLiteをバックエンドとした、単発（Once）および定期（Cron）のスケジューリング機能。サーバー再起動時にもスケジュールを自動復元 。
 
-### 3. リアクティブなUI（VanJS）
-`VanJS` と `vanjs-ext` を採用。軽量でありながら、バックエンドの状態変化を即座にダッシュボードへ反映します。
+* **型安全と自動生成:** Zodを用いてデバイスごとのコマンドスキーマを定義 。scripts/export-types.ts を実行することで、フロントエンド用のTypeScriptインターフェースとJSON Schemaを自動生成 。
 
-### 4. 状態の永続化（SQLite）
-「理想の状態」は SQLite (`state.db`) に保存されるため、システムの再起動後も直前の設定が自動的に復元されます。
+* **許容状態とクールダウン:** 「Warming up」などの過渡期の状態の許容や、コマンド送信直後のポーリングスキップ（クールダウン）など、実際のAV機器の挙動に寄り添った設計 。
 
-## ディレクトリ構造
+## **🛠 テクノロジースタック**
 
-```text
-├── main.ts             # サーバー・WebSocket・同期ループの定義
-├── lib/
-│   ├── manager.ts      # 状態管理・同期ロジックの核心
-│   ├── factory.ts      # デバイスインスタンスの生成工場
-│   ├── inventory.ts    # 機器リストの定義
-│   ├── protocols.ts    # 通信プロトコル (TCP/UDP) の実装
-│   ├── db.ts           # SQLite 永続化レイヤー
-│   ├── types.ts        # 共通型定義
-│   └── devices/        # 各機器の定義ファイル
-│       ├── PjLinkDevice.ts
-│       └── BrightSignDevice.ts
-└── ui/                 # フロントエンド (VanJS)
-    ├── app.ts          # エントリポイント
-    ├── store.ts        # WebSocket通信・リアクティブデータ
-    └── pages/
-        └── dashboard.ts # 監視・操作パネル
-```
+* **Runtime:** [Bun](https://bun.sh/) (高速な実行環境、ネイティブのTCP/UDPソケット、SQLite組み込み)  
+* **Language:** TypeScript  
+* **Validation:** Zod  
+* **Database:** Bun SQLite (state.db)
 
-## セットアップ
+* **Communication:** WebSocket (UIとサーバー間のリアルタイム同期)
 
-### 開発環境
-- [Bun](https://bun.sh/) (Runtime)
+## **📁 ディレクトリ構成**
 
-### インストール
-```bash
-bun install
-```
+Plaintext
 
-### 起動
-```bash
-# サーバー起動 (デフォルト: http://localhost:3000)
+simpleAVmanager/  
+├── main.ts                     \# アプリケーションのエントリーポイント（サーバー起動、初期化）  
+├── test-device.ts              \# コマンドラインから単一デバイスをテストするためのCLIツール  
+├── frontend-protocol.ts        \# 自動生成されるフロントエンド用型定義ファイル   
+├── protocol-schema.json        \# 自動生成されるJSON Schema  
+├── lib/  
+│   ├── cron.ts                 \# スケジューラー（Once/Cron）の登録・実行ロジック  
+│   ├── db.ts                   \# SQLiteデータベースのテーブル定義とCRUD操作   
+│   ├── factory.ts              \# 定義データからAVDeviceインスタンスを生成するファクトリー  
+│   ├── inventory.ts            \# 管理対象のデバイス一覧（IPアドレス、IDの登録）   
+│   ├── manager.ts              \# 状態同期のコアロジック（Device Shadow実装）  
+│   ├── protocols.ts            \# 通信プロトコル（TCP/UDP/HTTP）のTask実装  
+│   ├── types.ts                \# システム全体の共通型定義  
+│   ├── ws-router.ts            \# WebSocketクライアントからのメッセージルーティングとZod検証  
+│   └── devices/  
+│       ├── BrightSignDevice.ts \# BrightSign用デバイス定義（UDP）  
+│       ├── PjLinkDevice.ts     \# PJLink準拠プロジェクター用デバイス定義（TCP）  
+│       └── \_templateDevice.ts  \# 新規デバイス追加時のテンプレート   
+└── scripts/  
+    └── export-types.ts         \# Zodスキーマからフロント用型定義・JSONを書き出すスクリプト
+
+## **🚀 起動とテスト**
+
+### **サーバーの起動**
+
+Bunを使用してメインサーバーを起動します。デフォルトで http://localhost:3000 でリッスンします 。
+
+Bash
+
 bun run main.ts
-```
 
-## 新しいデバイスの追加方法
+### **フロントエンド用型の自動生成**
 
-`src/lib/devices/` 内に新しいファイルを作成し、`DeviceDefinition` に従ったオブジェクトを定義するだけです。
+バックエンドのZodスキーマを更新した場合、以下のスクリプトを実行してフロントエンド用のファイルを再生成してください 。
 
-```typescript
-// 例: MyDevice.ts
-export const myDeviceDef: DeviceDefinition<MySchema> = {
-  type: "MyDevice",
-  protocol: "TCP",
-  defaultPort: 8080,
-  states: {
-    power: {
-      translate: (v) => v === "?" ? "GET_PWR" : `SET_PWR ${v}`,
-      parse: (raw) => raw === "ON" ? "on" : "off"
-    }
-  }
-};
-```
+Bash
 
-その後、`lib/inventory.ts` に IPアドレスとIDを登録すれば完了です。
+bun run scripts/export-types.ts
 
-## 今後の改善予定
-- サーバー同期ループの安全性向上（再帰的 setTimeout への移行）
-- インベントリ情報の外部ファイル (JSON/YAML) 化
-- UIへの通信エラー状態のフィードバック
-- データベース保存のデバウンス処理
+### **デバイスの単体テスト**
 
+UIを介さずに、CLIから直接デバイスのコマンドをテストできるユーティリティが用意されています 。
+
+Bash
+
+\# 書式  
+bun run test-device.ts \--ip \<IP\_ADDRESS\> \--type \<DEVICE\_TYPE\> \[--key \<STATE\_KEY\>\] \[--val \<VALUE\_OR\_?\>\]
+
+\# 例: プロジェクターの電源状態を問い合わせる  
+bun run test-device.ts \--ip 192.168.1.100 \--type PjLinkDevice \--key power \--val ?
+
+## **🧩 新しいデバイスの追加方法**
+
+1. **デバイス定義ファイルの作成:**
+
+   lib/devices/\_templateDevice.ts をコピーし、新しいデバイス用のファイルを作成します 。
+
+2. **Zodスキーマの定義:** そのデバイスで操作・監視したい項目（電源、入力切替、音量など）を z.object() で定義します 。
+
+3. **DeviceDefinitionの記述:** 通信プロトコル（TCP/UDP/HTTP）、ポート番号、コマンドの変換ロジック（translate / parse）を記述します 。
+
+4. **インベントリへの登録:**
+
+   lib/inventory.ts を開き、作成した定義と対象デバイスのIPアドレス・管理IDを登録します 。
+
+5. **型の再生成:**
+
+   bun run scripts/export-types.ts を実行し、クライアント用プロトコルを更新します 。  
