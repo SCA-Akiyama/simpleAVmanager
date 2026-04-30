@@ -2,23 +2,31 @@
 import { deviceManager } from "./manager";
 import { scheduleDb } from "./db";
 
-/**
- * 💡 定期ジョブの登録
- */
+// 💡 実行中のCronジョブを保持するMapを追加
+export const activeCronJobs = new Map<string, any>();
+
 export const scheduleRecurring = (cronExp: string, ids: string[], patch: any, id: string = crypto.randomUUID()) => {
   scheduleDb.add(id, "cron", cronExp, ids, patch);
   
-  Bun.cron(cronExp, () => {
-    // 💡 安全装置: 発火した瞬間に「まだDBに存在するか」を確認する
-    const exists = scheduleDb.getAllCron().some((row: any) => row.id === id);
-    if (exists) {
-      deviceManager.updateDesired(ids, patch);
-    } else {
-      // ログを出してあげるか、静かに無視するかはお好みで
-      // console.log(`👻 [亡霊ジョブ回避] 削除済みの定期ジョブの発火を無視しました: ${id}`);
-    }
+  // 💡 戻り値のジョブインスタンスを変数で受け取る
+  const job = Bun.cron(cronExp, () => {
+    // ※ Mapでストップさせるため、毎回のDB生存確認(exists)は不要になります！
+    deviceManager.updateDesired(ids, patch);
   });
+  
+  // 💡 Mapに保存する
+  activeCronJobs.set(id, job);
   console.log(`⏰ [定期登録] ${cronExp} -> ${ids.join(",")}`);
+};
+
+// 💡 削除用の関数を追加
+export const cancelCronJob = (id: string) => {
+  const job = activeCronJobs.get(id);
+  if (job) {
+    job.stop(); // メモリから完全に削除
+    activeCronJobs.delete(id);
+    console.log(`🛑 [定期解除] メモリ上のジョブを停止しました: ${id}`);
+  }
 };
 
 /**
@@ -49,19 +57,18 @@ export const scheduleOnce = (date: Date, ids: string[], patch: any, id: string =
  * 💡 スケジューラーの初期化とポーリング
  */
 export const initCronJobs = () => {
-  console.log("⏰ スケジューラーを初期化 (完全DB駆動モデル)");
+  console.log("⏰ スケジューラーを初期化");
 
-  // 1. 起動時：DBから定期ジョブ(cron)をすべて復元
   const cronJobs = scheduleDb.getAllCron();
   cronJobs.forEach(row => {
     const ids = JSON.parse(row.target_ids);
     const patch = JSON.parse(row.patch);
-    Bun.cron(row.trigger, () => {
-      const exists = scheduleDb.getAllCron().some((r: any) => r.id === row.id);
-      if (exists) {
-        deviceManager.updateDesired(ids, patch);
-      }
+    
+    // 💡 起動時の復元でもMapに保存する
+    const job = Bun.cron(row.trigger, () => {
+      deviceManager.updateDesired(ids, patch);
     });
+    activeCronJobs.set(row.id, job);
   });
 
   // 2. 毎分のチェッカー（単発ジョブ用）

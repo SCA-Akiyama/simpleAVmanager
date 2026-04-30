@@ -4,19 +4,18 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "bun --hot run main.ts"
+    "dev": "bun --hot run main.ts",
+    "export-types": "bun run scripts/export-types.ts"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "zod-to-json-schema": "^3.25.2",
+    "zod-to-ts": "^2.0.0"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "@picocss/pico": "^2.1.1",
-    "lucide": "^1.11.0",
-    "vanjs-core": "^1.6.0",
-    "vanjs-ext": "^0.6.3",
-    "zod": "^4.3.6"
+    "zod": "^4.4.1"
   }
 }

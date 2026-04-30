@@ -1,5 +1,51 @@
 ﻿
 
+--- D:\Projects\simpleAVmanager\frontend-protocol.ts ---
+
+/**
+ * 笞・・閾ｪ蜍慕函謌舌ヵ繧｡繧､繝ｫ: 繝舌ャ繧ｯ繧ｨ繝ｳ繝峨・Zod繧ｹ繧ｭ繝ｼ繝槭°繧臥函謌舌＆繧後※縺・∪縺吶・ * 逶ｴ謗･邱ｨ髮・○縺壹√ヰ繝・け繧ｨ繝ｳ繝峨・Zod繧ｹ繧ｭ繝ｼ繝槭ｒ譖ｴ譁ｰ縺励※蜀咲函謌舌＠縺ｦ縺上□縺輔＞縲・ */
+
+// --- 騾壻ｿ｡繝｡繝・そ繝ｼ繧ｸ縺ｮ蝙・---
+// 庁 export 繧定ｿｽ蜉・・export type ClientMessage = {
+    type: "UPDATE";
+    ids: string[];
+    patch: {
+        [key: string]: any;
+    };
+    options: {
+        immediateOnly: boolean;
+    };
+} | {
+    type: "ADD_SCHEDULE";
+    scheduleType: "once" | "cron";
+    trigger: string;
+    ids: string[];
+    patch: {
+        [key: string]: any;
+    };
+} | {
+    type: "GET_SCHEDULES";
+    start?: string | undefined;
+    end?: string | undefined;
+} | {
+    type: "DELETE_SCHEDULE";
+    id: string;
+};
+
+// --- 蜷・ョ繝舌う繧ｹ縺ｮ繝励Ο繝代ユ繧｣(迥ｶ諷・蝙・---
+export type PjLinkDeviceState = {
+    power: "on" | "off" | "warming" | "cooling";
+    shutter: "open" | "close";
+    volume: number;
+};
+
+export type BrightSignDeviceState = {
+    command?: string | undefined;
+};
+
+// 豎守畑逧・↓菴ｿ縺医ｋ繧医≧縺ｫ蜈ｨ繝・ヰ繧､繧ｹ縺ｮ迥ｶ諷九ｒ縺ｾ縺ｨ繧√◆Union蝙・export type AnyDeviceState = PjLinkDeviceState | BrightSignDeviceState;
+
+
 --- D:\Projects\simpleAVmanager\main.ts ---
 
 import { deviceManager } from "./lib/manager";
@@ -20,16 +66,6 @@ const server = Bun.serve({
       if (success) return undefined; // Bun縺係S謗･邯壹∈蛻・ｊ譖ｿ縺医ｋ
     }
 
-    // --- 莉･荳九∵里蟄倥・HTTP驟堺ｿ｡繝ｭ繧ｸ繝・け ---
-    if (url.pathname === "/") return new Response(Bun.file("index.html"));
-    if (url.pathname === "/pico.css") return new Response(Bun.file("node_modules/@picocss/pico/css/pico.min.css"));
-    
-    if (url.pathname === "/main.js") {
-      const build = await Bun.build({ entrypoints: ["./ui/app.ts"] });
-      return new Response(build.outputs[0]);
-    }
-
-    return new Response("Not Found", { status: 404 });
   },
 
   websocket: {
@@ -146,23 +182,31 @@ runTest();
 import { deviceManager } from "./manager";
 import { scheduleDb } from "./db";
 
-/**
- * 庁 螳壽悄繧ｸ繝ｧ繝悶・逋ｻ骭ｲ
- */
+// 庁 螳溯｡御ｸｭ縺ｮCron繧ｸ繝ｧ繝悶ｒ菫晄戟縺吶ｋMap繧定ｿｽ蜉
+export const activeCronJobs = new Map<string, any>();
+
 export const scheduleRecurring = (cronExp: string, ids: string[], patch: any, id: string = crypto.randomUUID()) => {
   scheduleDb.add(id, "cron", cronExp, ids, patch);
   
-  Bun.cron(cronExp, () => {
-    // 庁 螳牙・陬・ｽｮ: 逋ｺ轣ｫ縺励◆迸ｬ髢薙↓縲後∪縺DB縺ｫ蟄伜惠縺吶ｋ縺九阪ｒ遒ｺ隱阪☆繧・
-    const exists = scheduleDb.getAllCron().some((row: any) => row.id === id);
-    if (exists) {
-      deviceManager.updateDesired(ids, patch);
-    } else {
-      // 繝ｭ繧ｰ繧貞・縺励※縺ゅ￡繧九°縲・撕縺九↓辟｡隕悶☆繧九°縺ｯ縺雁･ｽ縺ｿ縺ｧ
-      // console.log(`遜 [莠｡髴翫ず繝ｧ繝門屓驕ｿ] 蜑企勁貂医∩縺ｮ螳壽悄繧ｸ繝ｧ繝悶・逋ｺ轣ｫ繧堤┌隕悶＠縺ｾ縺励◆: ${id}`);
-    }
+  // 庁 謌ｻ繧雁､縺ｮ繧ｸ繝ｧ繝悶う繝ｳ繧ｹ繧ｿ繝ｳ繧ｹ繧貞､画焚縺ｧ蜿励￠蜿悶ｋ
+  const job = Bun.cron(cronExp, () => {
+    // 窶ｻ Map縺ｧ繧ｹ繝医ャ繝励＆縺帙ｋ縺溘ａ縲∵ｯ主屓縺ｮDB逕溷ｭ倡｢ｺ隱・exists)縺ｯ荳崎ｦ√↓縺ｪ繧翫∪縺呻ｼ・
+    deviceManager.updateDesired(ids, patch);
   });
+  
+  // 庁 Map縺ｫ菫晏ｭ倥☆繧・
+  activeCronJobs.set(id, job);
   console.log(`竢ｰ [螳壽悄逋ｻ骭ｲ] ${cronExp} -> ${ids.join(",")}`);
+};
+
+// 庁 蜑企勁逕ｨ縺ｮ髢｢謨ｰ繧定ｿｽ蜉
+export const cancelCronJob = (id: string) => {
+  const job = activeCronJobs.get(id);
+  if (job) {
+    job.stop(); // 繝｡繝｢繝ｪ縺九ｉ螳悟・縺ｫ蜑企勁
+    activeCronJobs.delete(id);
+    console.log(`尅 [螳壽悄隗｣髯､] 繝｡繝｢繝ｪ荳翫・繧ｸ繝ｧ繝悶ｒ蛛懈ｭ｢縺励∪縺励◆: ${id}`);
+  }
 };
 
 /**
@@ -193,19 +237,18 @@ export const scheduleOnce = (date: Date, ids: string[], patch: any, id: string =
  * 庁 繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｩ繝ｼ縺ｮ蛻晄悄蛹悶→繝昴・繝ｪ繝ｳ繧ｰ
  */
 export const initCronJobs = () => {
-  console.log("竢ｰ 繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｩ繝ｼ繧貞・譛溷喧 (螳悟・DB鬧・虚繝｢繝・Ν)");
+  console.log("竢ｰ 繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｩ繝ｼ繧貞・譛溷喧");
 
-  // 1. 襍ｷ蜍墓凾・咼B縺九ｉ螳壽悄繧ｸ繝ｧ繝・cron)繧偵☆縺ｹ縺ｦ蠕ｩ蜈・
   const cronJobs = scheduleDb.getAllCron();
   cronJobs.forEach(row => {
     const ids = JSON.parse(row.target_ids);
     const patch = JSON.parse(row.patch);
-    Bun.cron(row.trigger, () => {
-      const exists = scheduleDb.getAllCron().some((r: any) => r.id === row.id);
-      if (exists) {
-        deviceManager.updateDesired(ids, patch);
-      }
+    
+    // 庁 襍ｷ蜍墓凾縺ｮ蠕ｩ蜈・〒繧・ap縺ｫ菫晏ｭ倥☆繧・
+    const job = Bun.cron(row.trigger, () => {
+      deviceManager.updateDesired(ids, patch);
     });
+    activeCronJobs.set(row.id, job);
   });
 
   // 2. 豈主・縺ｮ繝√ぉ繝・き繝ｼ・亥腰逋ｺ繧ｸ繝ｧ繝也畑・・
@@ -1129,122 +1172,94 @@ export const templateDef: DeviceDefinition<TemplateSchema> = {
 };
 
 
---- D:\Projects\simpleAVmanager\ui\app.ts ---
+--- D:\Projects\simpleAVmanager\scripts\export-types.ts ---
 
-// src/ui/app.ts
-import van from "vanjs-core";
-import { status } from "./store";
-import { tags } from "./tags";
-import { Dashboard } from "./pages/dashboard";
+// scripts/export-types.ts
+import { zodToTs, createTypeAlias, printNode } from "zod-to-ts";
+import { zodToJsonSchema } from "zod-to-json-schema";
+import { z } from "zod";
+import { wsClientMessageSchema } from "../lib/ws-router";
+import { inventory } from "../lib/inventory";
 
-export const App = () => {
-  return tags.main({ class: "container" },
-    tags.header(
-      tags.h1("Simple AV Manager"),
-      tags.p("繧ｹ繝・・繧ｿ繧ｹ: ", status)
-    ),
-    tags.article(
-      Dashboard()
-    )
-  );
-};
+console.log("屏・・繧ｯ繝ｩ繧､繧｢繝ｳ繝亥髄縺代せ繧ｭ繝ｼ繝槭ｒ繧ｨ繧ｯ繧ｹ繝昴・繝井ｸｭ...");
 
-van.add(document.body, App());
+let idCounter = 0;
+const auxStore = { nextId: () => String(idCounter++), definitions: new Map() };
 
-
---- D:\Projects\simpleAVmanager\ui\store.ts ---
-
-// src/ui/store.ts
-import van from "vanjs-core";
-import { reactive } from "vanjs-ext";
-
-// UI縺檎ｮ｡逅・☆繧句髪荳縺ｮ縲悟崋螳壹阪Μ繧ｹ繝・
-export const devices = reactive<any[]>([]);
-export const status = van.state("繧ｵ繝ｼ繝舌・謗･邯壻ｸｭ...");
-
-const socket = new WebSocket(`ws://${location.host}/ws`);
-
-socket.onmessage = (event) => {
-  try {
-    const msg = JSON.parse(event.data);
-    
-    // --- 1. 蛻晏屓謗･邯壽凾 (INIT): 繝ｪ繧ｹ繝医・譫邨・∩繧貞崋螳壹☆繧・---
-    if (msg.type === "INIT") {
-      devices.length = 0; // 蠢ｵ縺ｮ縺溘ａ繝ｪ繧ｻ繝・ヨ
-      msg.data.forEach((d: any) => {
-        // 繧ｪ繝悶ず繧ｧ繧ｯ繝亥・菴薙ｒ繝ｪ繧｢繧ｯ繝・ぅ繝悶↓縺励※霑ｽ蜉
-        devices.push(reactive(d));
-      });
-      status.val = "繧ｪ繝ｳ繝ｩ繧､繝ｳ";
-    }
-
-    // --- 2. 迥ｶ諷区峩譁ｰ譎・(SYNC): 荳ｭ霄ｫ縺ｮ蛟､・・esired/actual・峨□縺代ｒ譖ｸ縺肴鋤縺医ｋ ---
-    if (msg.type === "SYNC") {
-      msg.data.forEach((incoming: any) => {
-        const target = devices.find(d => d.id === incoming.id);
-        if (target) {
-          // 驥崎ｦ・ target 閾ｪ菴薙ｒ蟾ｮ縺玲崛縺医ｋ縺ｮ縺ｧ縺ｯ縺ｪ縺上∽ｸｭ霄ｫ縺ｮ繝励Ο繝代ユ繧｣繧呈峩譁ｰ縺吶ｋ
-          // 縺薙ｌ縺ｫ繧医ｊ縲．OM隕∫ｴ・・r・峨・菴懊ｊ逶ｴ縺励′逋ｺ逕溘＠縺ｪ縺上↑繧翫∪縺・
-          target.desired = incoming.desired;
-          target.actual = incoming.actual;
-        }
-      });
-    }
-  } catch (e) {
-    console.error("繝・・繧ｿ蜷梧悄繧ｨ繝ｩ繝ｼ:", e);
+const deviceSchemas = new Map<string, z.ZodObject<any>>();
+for (const device of inventory) {
+  if (device.zodSchema && !deviceSchemas.has(device.type)) {
+    deviceSchemas.set(device.type, device.zodSchema);
   }
+}
+
+// ==========================================
+// 1. TypeScript迺ｰ蠅・髄縺・(.ts 縺ｮ邨・∩遶九※)
+// ==========================================
+const { node: msgNode } = zodToTs(wsClientMessageSchema, { auxiliaryTypeStore: auxStore });
+const msgAlias = createTypeAlias(msgNode, "ClientMessage");
+
+let tsCode = `
+/**
+ * 笞・・閾ｪ蜍慕函謌舌ヵ繧｡繧､繝ｫ: 繝舌ャ繧ｯ繧ｨ繝ｳ繝峨・Zod繧ｹ繧ｭ繝ｼ繝槭°繧臥函謌舌＆繧後※縺・∪縺吶・
+ * 逶ｴ謗･邱ｨ髮・○縺壹√ヰ繝・け繧ｨ繝ｳ繝峨・Zod繧ｹ繧ｭ繝ｼ繝槭ｒ譖ｴ譁ｰ縺励※蜀咲函謌舌＠縺ｦ縺上□縺輔＞縲・
+ */
+
+// --- 騾壻ｿ｡繝｡繝・そ繝ｼ繧ｸ縺ｮ蝙・---
+// 庁 export 繧定ｿｽ蜉・・
+export ${printNode(msgAlias)}
+
+// --- 蜷・ョ繝舌う繧ｹ縺ｮ繝励Ο繝代ユ繧｣(迥ｶ諷・蝙・---
+`;
+
+const stateTypeNames: string[] = [];
+
+for (const [deviceType, schema] of deviceSchemas.entries()) {
+  const typeName = `${deviceType}State`;
+  stateTypeNames.push(typeName);
+
+  const { node } = zodToTs(schema, { auxiliaryTypeStore: auxStore });
+  const alias = createTypeAlias(node, typeName);
+  
+  // 庁 縺薙％縺ｫ繧・export 繧定ｿｽ蜉・・
+  tsCode += `export ${printNode(alias)}\n\n`;
+}
+
+if (stateTypeNames.length > 0) {
+  tsCode += `// 豎守畑逧・↓菴ｿ縺医ｋ繧医≧縺ｫ蜈ｨ繝・ヰ繧､繧ｹ縺ｮ迥ｶ諷九ｒ縺ｾ縺ｨ繧√◆Union蝙欺n`;
+  tsCode += `export type AnyDeviceState = ${stateTypeNames.join(" | ")};\n`;
+}
+
+await Bun.write("./frontend-protocol.ts", tsCode.trim());
+console.log("笨・TypeScript蝙句ｮ夂ｾｩ繧貞・蜉帙＠縺ｾ縺励◆ (frontend-protocol.ts)");
+
+
+// ==========================================
+// 2. 莉冶ｨ隱樒腸蠅・髄縺・(.json 縺ｮ邨・∩遶九※)
+// ==========================================
+const finalJsonSchema: any = {
+  $schema: "http://json-schema.org/draft-07/schema#",
+  description: "Simple AV Manager Protocol Schema",
+  definitions: {}
 };
 
-// 謫堺ｽ憺∽ｿ｡髢｢謨ｰ縺ｪ縺ｩ縺ｯ螟画峩縺ｪ縺・
-export const sendUpdate = (ids: string[], patch: any, immediate = false) => {
-  socket.send(JSON.stringify({ type: "UPDATE", ids, patch, options: { immediateOnly: immediate } }));
-};
+// 庁 菫ｮ豁｣: 蜀阪・ `as any` 繧剃ｻ倥￠縺ｦTS繧ｳ繝ｳ繝代う繝ｩ繧貞ｼｷ蛻ｶ遯∫ｴ縺励∪縺呻ｼ・
+const msgJson = zodToJsonSchema(wsClientMessageSchema as any, { $refStrategy: "none" });
+if (msgJson) {
+  delete (msgJson as any).$schema;
+  finalJsonSchema.definitions["ClientMessage"] = msgJson;
+}
 
+for (const [deviceType, schema] of deviceSchemas.entries()) {
+  const typeName = `${deviceType}State`;
+  
+  // 庁 菫ｮ豁｣: 縺薙％繧・`as any` 繧剃ｻ倥￠縺ｾ縺呻ｼ・
+  const devJson = zodToJsonSchema(schema as any, { $refStrategy: "none" });
+  if (devJson) {
+    delete (devJson as any).$schema;
+    finalJsonSchema.definitions[typeName] = devJson;
+  }
+}
 
---- D:\Projects\simpleAVmanager\ui\tags.ts ---
-
-import van from "vanjs-core";
-
-// TypeScript縺梧ｨ呎ｺ悶〒謖√▲縺ｦ縺・ｋ蜈ｨHTML繧ｿ繧ｰ縺ｮ繝ｪ繧ｹ繝・(HTMLElementTagNameMap) 繧・
-// VanJS縺ｮ繧ｿ繧ｰ髢｢謨ｰ縺ｮ蝙九↓螟画鋤縺励∪縺・
-type VanTags = {
-  [K in keyof HTMLElementTagNameMap]: (...args: any[]) => HTMLElementTagNameMap[K];
-} & Record<string, (...args: any[]) => Element>;
-
-// 蜈ｨ縺ｦ縺ｮ繧ｿ繧ｰ縺悟・縺｣縺溘碁ｭ疲ｳ輔・繧ｪ繝悶ず繧ｧ繧ｯ繝医阪ｒ菴懊ｋ
-export const tags = van.tags as unknown as VanTags;
-
-
---- D:\Projects\simpleAVmanager\ui\pages\dashboard.ts ---
-
-// src/ui/pages/dashboard.ts
-import { list } from "vanjs-ext";
-import { tags } from "../tags";
-import { devices, sendUpdate } from "../store";
-
-export const Dashboard = () => {
-  return tags.table({ class: "striped" },
-    tags.thead(
-      tags.tr(tags.th("繝・ヰ繧､繧ｹID"), tags.th("逅・Φ"), tags.th("迴ｾ螳・), tags.th("謫堺ｽ・))
-    ),
-    // list髢｢謨ｰ縺ｯ縲碁・蛻励・隕∫ｴ・・evice繧ｪ繝悶ず繧ｧ繧ｯ繝茨ｼ峨阪→DOM・・r・峨ｒ1蟇ｾ1縺ｧ邨舌・縺､縺代∪縺・
-    list(tags.tbody(), devices, (device) => 
-      tags.tr(
-        tags.td(device.val.id),
-        // () => 縺ｧ蝗ｲ繧縺薙→縺ｧ縲∽ｸｭ霄ｫ縺ｮ繝励Ο繝代ユ繧｣縺梧峩譁ｰ縺輔ｌ縺滓凾縺縺代％縺薙′譖ｸ縺肴鋤繧上ｊ縺ｾ縺・
-        tags.td(() => tags.span({ class: "badge" }, device.val.desired.power || "-")),
-        tags.td(() => tags.span({ class: "badge" }, device.val.actual.power || "-")),
-        tags.td(
-          tags.button({
-            onclick: () => sendUpdate([device.val.id], { power: "on" }),
-            class: "outline"
-          }, "ON"),
-          tags.button({
-            onclick: () => sendUpdate([device.val.id], { power: "off" }),
-            class: "outline secondary"
-          }, "OFF")
-        )
-      )
-    )
-  );
-};
+await Bun.write("./protocol-schema.json", JSON.stringify(finalJsonSchema, null, 2));
+console.log("笨・JSON Schema繧貞・蜉帙＠縺ｾ縺励◆ (protocol-schema.json)");

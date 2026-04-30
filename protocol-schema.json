@@ -1,0 +1,9 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Simple AV Manager Protocol Schema",
+  "definitions": {
+    "ClientMessage": {},
+    "PjLinkDeviceState": {},
+    "BrightSignDeviceState": {}
+  }
+}

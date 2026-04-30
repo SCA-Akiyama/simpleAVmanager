@@ -16,16 +16,6 @@ const server = Bun.serve({
       if (success) return undefined; // BunがWS接続へ切り替える
     }
 
-    // --- 以下、既存のHTTP配信ロジック ---
-    if (url.pathname === "/") return new Response(Bun.file("index.html"));
-    if (url.pathname === "/pico.css") return new Response(Bun.file("node_modules/@picocss/pico/css/pico.min.css"));
-    
-    if (url.pathname === "/main.js") {
-      const build = await Bun.build({ entrypoints: ["./ui/app.ts"] });
-      return new Response(build.outputs[0]);
-    }
-
-    return new Response("Not Found", { status: 404 });
   },
 
   websocket: {
