@@ -6,14 +6,14 @@
  * 笞・・閾ｪ蜍慕函謌舌ヵ繧｡繧､繝ｫ: 繝舌ャ繧ｯ繧ｨ繝ｳ繝峨・Zod繧ｹ繧ｭ繝ｼ繝槭°繧臥函謌舌＆繧後※縺・∪縺吶・ * 逶ｴ謗･邱ｨ髮・○縺壹√ヰ繝・け繧ｨ繝ｳ繝峨・Zod繧ｹ繧ｭ繝ｼ繝槭ｒ譖ｴ譁ｰ縺励※蜀咲函謌舌＠縺ｦ縺上□縺輔＞縲・ */
 
 // --- 騾壻ｿ｡繝｡繝・そ繝ｼ繧ｸ縺ｮ蝙・---
-// 庁 export 繧定ｿｽ蜉・・export type ClientMessage = {
+export type ClientMessage = {
     type: "UPDATE";
     ids: string[];
     patch: {
-        [key: string]: any;
+        [x: string]: any;
     };
-    options: {
-        immediateOnly: boolean;
+    options?: {
+        immediateOnly?: boolean;
     };
 } | {
     type: "ADD_SCHEDULE";
@@ -21,7 +21,7 @@
     trigger: string;
     ids: string[];
     patch: {
-        [key: string]: any;
+        [x: string]: any;
     };
 } | {
     type: "GET_SCHEDULES";
@@ -51,6 +51,7 @@ export type BrightSignDeviceState = {
 import { deviceManager } from "./lib/manager";
 import { initCronJobs } from "./lib/cron";
 import { handleClientMessage } from "./lib/ws-router";
+import { closeDb } from "./lib/db";
 
 deviceManager.init();
 initCronJobs();
@@ -94,6 +95,16 @@ deviceManager.startPolling(() => {
 });
 
 console.log(`噫 Server started at http://localhost:${server.port}`);
+
+const shutdown = () => {
+  console.log("\n尅 繧ｵ繝ｼ繝舌・縺ｮ繧ｷ繝｣繝・ヨ繝繧ｦ繝ｳ繧帝幕蟋九＠縺ｾ縺・..");
+  server.stop(true); // 騾ｲ陦御ｸｭ縺ｮWebSocket繧ЗTTP繧貞ｮ牙・縺ｫ髢峨§繧・
+  closeDb();
+  process.exit(0);
+};
+
+process.on("SIGINT", shutdown);  // Ctrl+C
+process.on("SIGTERM", shutdown); // systemd 繧・Docker 縺九ｉ縺ｮ邨ゆｺ・す繧ｰ繝翫Ν
 
 
 --- D:\Projects\simpleAVmanager\test-device.ts ---
@@ -180,7 +191,7 @@ runTest();
 
 // src/lib/cron.ts
 import { deviceManager } from "./manager";
-import { scheduleDb } from "./db";
+import { scheduleDb , logDb} from "./db";
 
 // 庁 螳溯｡御ｸｭ縺ｮCron繧ｸ繝ｧ繝悶ｒ菫晄戟縺吶ｋMap繧定ｿｽ蜉
 export const activeCronJobs = new Map<string, any>();
@@ -190,6 +201,7 @@ export const scheduleRecurring = (cronExp: string, ids: string[], patch: any, id
   
   // 庁 謌ｻ繧雁､縺ｮ繧ｸ繝ｧ繝悶う繝ｳ繧ｹ繧ｿ繝ｳ繧ｹ繧貞､画焚縺ｧ蜿励￠蜿悶ｋ
   const job = Bun.cron(cronExp, () => {
+    logDb.add("INFO", "CRON", "EXECUTE_CRON", { cronExp, patch }, ids.join(","));
     // 窶ｻ Map縺ｧ繧ｹ繝医ャ繝励＆縺帙ｋ縺溘ａ縲∵ｯ主屓縺ｮDB逕溷ｭ倡｢ｺ隱・exists)縺ｯ荳崎ｦ√↓縺ｪ繧翫∪縺呻ｼ・
     deviceManager.updateDesired(ids, patch);
   });
@@ -273,6 +285,7 @@ export const initCronJobs = () => {
         const stillExists = scheduleDb.getAll().some((r: any) => r.id === row.id);
         
         if (stillExists) {
+          logDb.add("INFO", "CRON", "EXECUTE_ONCE", { trigger: row.trigger, patch }, ids.join(","));
           deviceManager.updateDesired(ids, patch);
           scheduleDb.delete(row.id); // 螳溯｡後′螳御ｺ・＠縺溽椪髢薙↓DB縺九ｉ豸医☆
         } else {
@@ -281,6 +294,11 @@ export const initCronJobs = () => {
         }
       }, delay);
     });
+  });
+
+  Bun.cron("0 3 * * *", () => {
+    logDb.cleanupOldLogs(30);
+    console.log("ｧｹ [繝ｭ繧ｰ繝ｭ繝ｼ繝・・繧ｷ繝ｧ繝ｳ] 30譌･莉･荳雁燕縺ｮ繝ｭ繧ｰ繧貞炎髯､縺励∪縺励◆");
   });
 };
 
@@ -366,6 +384,47 @@ export const scheduleDb = {
   }
 };
 
+//  逶｣譟ｻ繝ｭ繧ｰ逕ｨ 
+db.run(`
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    timestamp INTEGER,
+    level TEXT,
+    source TEXT,
+    device_id TEXT,
+    action TEXT,
+    details TEXT
+  )
+`);
+
+export const logDb = {
+  // 繝ｭ繧ｰ繧定ｿｽ蜉縺吶ｋ
+  add: (
+    level: "INFO" | "WARN" | "ERROR", 
+    source: "USER" | "CRON" | "DEVICE" | "SYSTEM", 
+    action: string, 
+    details: any, 
+    deviceId: string | null = null
+  ) => {
+    const query = db.prepare(`
+      INSERT INTO audit_logs (id, timestamp, level, source, device_id, action, details)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    `);
+    query.run(crypto.randomUUID(), Date.now(), level, source, deviceId, action, JSON.stringify(details));
+  },
+
+  // 謖・ｮ壹＠縺滓律謨ｰ繧医ｊ蜿､縺・Ο繧ｰ繧貞炎髯､縺吶ｋ・医ョ繝輔か繝ｫ繝・0譌･・・
+  cleanupOldLogs: (daysToKeep = 30) => {
+    const cutoffTime = Date.now() - (daysToKeep * 24 * 60 * 60 * 1000);
+    db.query("DELETE FROM audit_logs WHERE timestamp < ?1").run(cutoffTime);
+  }
+};
+
+export const closeDb = () => {
+  db.close();
+  console.log("逃 繝・・繧ｿ繝吶・繧ｹ謗･邯壹ｒ螳牙・縺ｫ髢峨§縺ｾ縺励◆");
+};
+
 
 --- D:\Projects\simpleAVmanager\lib\factory.ts ---
 
@@ -446,20 +505,109 @@ export const createDevice = <T>(
 --- D:\Projects\simpleAVmanager\lib\inventory.ts ---
 
 // src/lib/inventory.ts
+import { z } from "zod";
 import { createDevice } from "./factory";
-import { pjLinkDef } from "./devices/PjLinkDevice";
-import { brightSignDef } from "./devices/BrightSignDevice";
+import { readdir } from "node:fs/promises";
+import path from "node:path";
 
-export const inventory = [
-  createDevice(pjLinkDef, { id: "pj-01", ip: "192.168.1.100" }),
-  createDevice(brightSignDef, { id: "bs-01", ip: "192.168.1.110" }), 
-] as const;
+// 1. 蜍慕噪縺ｫ蜿朱寔縺吶ｋ繝・ヰ繧､繧ｹ螳夂ｾｩ縺ｮ霎樊嶌
+const definitions: Record<string, any> = {};
+
+// 検 譁ｰ讖溯・・・devices 繝輔か繝ｫ繝蜀・・ .ts 繝輔ぃ繧､繝ｫ繧定・蜍輔せ繧ｭ繝｣繝ｳ縺励※繧､繝ｳ繝昴・繝医☆繧・
+const loadDefinitions = async () => {
+  // Bun縺ｮ import.meta.dir 繧剃ｽｿ縺｣縺ｦ縲∫樟蝨ｨ縺ｮ繝輔ぃ繧､繝ｫ縺ｮ縺ゅｋ繝・ぅ繝ｬ繧ｯ繝医Μ縺九ｉ縺ｮ逶ｸ蟇ｾ繝代せ繧貞叙蠕・
+  const devicesDir = path.join(import.meta.dir, "devices");
+  const files = await readdir(devicesDir);
+
+  for (const file of files) {
+    // 繝・Φ繝励Ξ繝ｼ繝医ヵ繧｡繧､繝ｫ・・ 縺ｧ蟋九∪繧具ｼ峨ｄ縲ゝypeScript莉･螟悶・繝輔ぃ繧､繝ｫ縺ｯ繧ｹ繧ｭ繝・・
+    if (file.startsWith("_") || !file.endsWith(".ts")) continue;
+
+    // 蜍慕噪繧､繝ｳ繝昴・繝医ｒ螳溯｡・
+    const mod = await import(`./devices/${file}`);
+    
+    // 繝｢繧ｸ繝･繝ｼ繝ｫ蜀・・繧ｨ繧ｯ繧ｹ繝昴・繝医°繧峨．eviceDefinition縺ｮ隕∽ｻｶ・・ype縺ｨprotocol縺後≠繧九°・峨ｒ貅縺溘☆繧ゅ・繧呈爾縺・
+    for (const exp of Object.values(mod)) {
+      if (exp && typeof exp === "object" && "type" in exp && "protocol" in exp) {
+        // 隕九▽縺代◆繧峨√◎縺ｮ type 繧偵く繝ｼ縺ｫ縺励※霎樊嶌縺ｫ逋ｻ骭ｲ・・
+        definitions[(exp as any).type] = exp;
+      }
+    }
+  }
+};
+
+// CSV繧定ｪｭ縺ｿ霎ｼ繧蜑阪↓縲√∪縺壹・繝・ヰ繧､繧ｹ螳夂ｾｩ繧偵☆縺ｹ縺ｦ髮・ａ繧・
+await loadDefinitions();
+
+// 2. CSV縺ｮ1陦後↓蟇ｾ縺吶ｋ蜴ｳ譬ｼ縺ｪ繝舌Μ繝・・繧ｷ繝ｧ繝ｳ繧ｹ繧ｭ繝ｼ繝・
+const inventoryRowSchema = z.object({
+  id: z.string().min(1, "ID縺ｯ蠢・医〒縺・),
+  ip: z.string().ip("豁｣縺励＞IP繧｢繝峨Ξ繧ｹ蠖｢蠑上〒縺ｯ縺ゅｊ縺ｾ縺帙ｓ"),
+  // 検 z.enum() 縺ｧ縺ｯ縺ｪ縺上∝虚逧・↓髮・ａ縺・definitions 縺ｮ繧ｭ繝ｼ縺ｫ蟄伜惠縺吶ｋ縺九ｒ繝√ぉ繝・け縺吶ｋ
+  type: z.string().refine(val => val in definitions, { message: "譛ｪ逋ｻ骭ｲ縺ｮ讖溷勣繧ｿ繧､繝励〒縺・ }),
+  port: z.string().optional().transform(v => v ? parseInt(v, 10) : undefined)
+});
+
+// 3. 隱ｭ縺ｿ霎ｼ縺ｿ繝ｭ繧ｸ繝・け
+const loadInventory = async () => {
+  const csvFile = Bun.file("inventory.csv");
+
+  if (!(await csvFile.exists())) {
+    console.warn("笞・・inventory.csv 縺瑚ｦ九▽縺九ｊ縺ｾ縺帙ｓ縲らｩｺ縺ｮ繧､繝ｳ繝吶Φ繝医Μ縺ｧ襍ｷ蜍輔＠縺ｾ縺吶・);
+    return [];
+  }
+
+  const csvText = await csvFile.text(); 
+  const lines = csvText.split(/\r?\n/);
+  const devices = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]?.trim();
+    
+    // 遨ｺ陦後ｄ繧ｳ繝｡繝ｳ繝郁｡後・辟｡隕・
+    if (!line || line.startsWith("#")) continue;
+
+    const cols = line.split(",");
+    const id = cols[0]?.trim();
+    const ip = cols[1]?.trim();
+    const type = cols[2]?.trim();
+    const port = cols[3]?.trim();
+
+    // 讖溷勣繧ｿ繧､繝励′螳夂ｾｩ霎樊嶌縺ｫ蟄伜惠縺励↑縺・｡鯉ｼ医・繝・ム繝ｼ陦後↑縺ｩ・峨・辟｡隕・
+    if (!type || !(type in definitions)) continue;
+
+    const result = inventoryRowSchema.safeParse({ id, ip, type, port });
+    
+    if (!result.success) {
+      console.error(`笶・inventory.csv 險ｭ螳壹お繝ｩ繝ｼ (陦・${i + 1} - ${id || '荳肴・'}):`);
+      result.error.issues.forEach(issue => {
+        console.error(`   - [${issue.path.join('.')}] ${issue.message}`);
+      });
+      process.exit(1); 
+    }
+
+    const validData = result.data;
+    const def = definitions[validData.type];
+
+    devices.push(createDevice(def, { 
+      id: validData.id, 
+      ip: validData.ip, 
+      port: validData.port 
+    }));
+  }
+
+  console.log(`逃 ${devices.length} 蜿ｰ縺ｮ繝・ヰ繧､繧ｹ繧・inventory.csv 縺九ｉ隱ｭ縺ｿ霎ｼ縺ｿ縺ｾ縺励◆`);
+  return devices;
+};
+
+// 4. 繝医ャ繝励Ξ繝吶Νawait縺ｧ繧ｨ繧ｯ繧ｹ繝昴・繝・
+export const inventory = await loadInventory();
 
 
 --- D:\Projects\simpleAVmanager\lib\manager.ts ---
 
 import { inventory } from "./inventory";
-import { stateDb } from "./db";
+import { stateDb, logDb } from "./db";
 import type { AVDevice } from "./types";
 
 // 繝｡繝｢繝ｪ荳翫・迥ｶ諷狗ｮ｡逅・
@@ -502,7 +650,7 @@ export const deviceManager = {
   /**
    * 繝ｦ繝ｼ繧ｶ繝ｼ謫堺ｽ懊ｄAPI縺九ｉ縺ｮ縲檎炊諠ｳ縲阪・譖ｴ譁ｰ繧貞女縺台ｻ倥￠繧・(Fast Path縺ｮ襍ｷ轤ｹ)
    */
-updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
+  updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
     const now = Date.now();
 
     for (const id of ids) {
@@ -543,21 +691,18 @@ updateDesired: async (ids: string[], patch: any, options = { immediateOnly: fals
   },
  
   startPolling: (onSyncFinished?: () => void) => {
-    // inventory 縺ｫ逋ｻ骭ｲ縺輔ｌ縺溘ョ繝舌う繧ｹ縺斐→縺ｫ迢ｬ遶九＠縺溘Ν繝ｼ繝励ｒ遶九■荳翫￡繧・
-    inventory.forEach(device => {
+    // 蛻・淵襍ｷ蜍慕畑縺ｮ繧､繝ｳ繧ｿ繝ｼ繝舌Ν・井ｾ具ｼ・0遘帝俣縺ｧ200蜿ｰ繧呈轟縺上↑繧峨・蜿ｰ縺ゅ◆繧・0ms縺壹ｉ縺呻ｼ・
+    const STAGGER_MS = 50; 
+
+    inventory.forEach((device, index) => {
       const runDeviceLoop = async () => {
-        // Slow Path 縺ｨ縺励※1蜿ｰ縺縺大酔譛・
         await deviceManager.syncOne(device.id, true);
-        
-        // 蜷梧悄縺檎ｵゅｏ縺｣縺溘ｉ繧ｳ繝ｼ繝ｫ繝舌ャ繧ｯ繧堤匱轣ｫ・・I縺ｸ騾夂衍・・
         if (onSyncFinished) onSyncFinished();
-        
-        // 縺昴・繝・ヰ繧､繧ｹ縺ｮ騾壻ｿ｡縺悟ｮ御ｺ・＠縺ｦ縺九ｉ10遘貞ｾ後↓谺｡縺ｮ繧ｵ繧､繧ｯ繝ｫ繧貞ｮ溯｡・
         setTimeout(runDeviceLoop, 10000);
       };
 
-      // 蛻晏屓襍ｷ蜍・
-      runDeviceLoop();
+      // 蛻晏屓襍ｷ蜍輔ｒ蟆代＠縺壹▽縺壹ｉ縺呻ｼ・hundering Herd蟇ｾ遲厄ｼ・
+      setTimeout(runDeviceLoop, index * STAGGER_MS);
     });
   },
 
@@ -661,10 +806,35 @@ updateDesired: async (ids: string[], patch: any, options = { immediateOnly: fals
       }
     }
 
+    const isNowOnline = !networkError;
+    const isNowError = controlError;
+    const prevActual = actualMap.get(id);
+    
+// 庁 迥ｶ諷九′螟牙喧縺励◆迸ｬ髢薙・縺ｿ繝ｭ繧ｰ繧定ｨ倬鹸縺吶ｋ・医せ繝代Β髦ｲ豁｢・・
+    if (prevActual) {
+      // 1. 繝阪ャ繝医Ρ繝ｼ繧ｯ迥ｶ諷九・螟牙喧・・AN謚懊￠繝ｻ蠕ｩ譌ｧ縺ｪ縺ｩ・・
+      if (prevActual._online !== isNowOnline) {
+        if (isNowOnline) {
+          logDb.add("INFO", "SYSTEM", "DEVICE_RECOVERED", { message: "騾壻ｿ｡縺悟ｾｩ譌ｧ縺励∪縺励◆" }, id);
+        } else {
+          logDb.add("ERROR", "DEVICE", "DEVICE_OFFLINE", { message: "騾壻ｿ｡縺碁皮ｵｶ縺励∪縺励◆" }, id);
+        }
+      }
+
+      // 2. 讖溷勣縺ｮ蛻ｶ蠕｡繧ｨ繝ｩ繝ｼ迥ｶ諷九・螟牙喧・医さ繝槭Φ繝画拠蜷ｦ繝ｻ隗｣豸医↑縺ｩ・・
+      if (prevActual._error !== isNowError) {
+        if (isNowError) {
+          logDb.add("ERROR", "DEVICE", "DEVICE_ERROR", { message: "讖溷勣縺後お繝ｩ繝ｼ繧定ｿ斐＠縺ｦ縺・∪縺・ }, id);
+        } else {
+          logDb.add("INFO", "SYSTEM", "ERROR_CLEARED", { message: "讖溷勣縺ｮ繧ｨ繝ｩ繝ｼ縺瑚ｧ｣豸医＠縺ｾ縺励◆" }, id);
+        }
+      }
+    }
+
     actualMap.set(id, { 
       ...actual, 
-      _online: !networkError, // 繝阪ャ繝医Ρ繝ｼ繧ｯ騾壻ｿ｡縺御ｸ蠎ｦ縺ｧ繧ょ､ｱ謨励☆繧後・ false
-      _error: controlError    // 繝・ヰ繧､繧ｹ縺御ｸ蠎ｦ縺ｧ繧ゅお繝ｩ繝ｼ繧定ｿ斐○縺ｰ true
+      _online: isNowOnline, // 繝阪ャ繝医Ρ繝ｼ繧ｯ騾壻ｿ｡縺御ｸ蠎ｦ縺ｧ繧ょ､ｱ謨励☆繧後・ false
+      _error: isNowError    // 繝・ヰ繧､繧ｹ縺御ｸ蠎ｦ縺ｧ繧ゅお繝ｩ繝ｼ繧定ｿ斐○縺ｰ true
     });
   },
 
@@ -893,7 +1063,7 @@ export interface AVDevice<TSchema = any> {
 // src/lib/ws-router.ts
 import { z } from "zod";
 import { deviceManager } from "./manager";
-import { scheduleDb } from "./db";
+import { scheduleDb, logDb} from "./db";
 
 // --- 繧ｹ繧ｭ繝ｼ繝槫ｮ夂ｾｩ ---
 
@@ -951,11 +1121,13 @@ export const handleClientMessage = async (
 
     switch (msg.type) {
       case "UPDATE":
+        logDb.add("INFO", "USER", "UPDATE_DESIRED", { patch: msg.patch }, msg.ids.join(","));
         await deviceManager.updateDesired(msg.ids, msg.patch, msg.options);
         broadcastUpdate();
         break;
 
       case "ADD_SCHEDULE":
+        logDb.add("INFO", "USER", "ADD_SCHEDULE", { trigger: msg.trigger, patch: msg.patch, type: msg.scheduleType }, msg.ids.join(","));
         const { scheduleOnce, scheduleRecurring } = await import("./cron");
         if (msg.scheduleType === "once") {
           scheduleOnce(new Date(msg.trigger), msg.ids, msg.patch);
@@ -986,6 +1158,7 @@ export const handleClientMessage = async (
         break;
 
       case "DELETE_SCHEDULE":
+        logDb.add("INFO", "USER", "DELETE_SCHEDULE", { schedule_id: msg.id });
         // 庁 繝・・繧ｿ繝吶・繧ｹ縺九ｉ蜑企勁
         scheduleDb.delete(msg.id);
         console.log(`卵・・[繧ｹ繧ｱ繧ｸ繝･繝ｼ繝ｫ蜑企勁] ID: ${msg.id}`);
@@ -1181,10 +1354,7 @@ import { z } from "zod";
 import { wsClientMessageSchema } from "../lib/ws-router";
 import { inventory } from "../lib/inventory";
 
-console.log("屏・・繧ｯ繝ｩ繧､繧｢繝ｳ繝亥髄縺代せ繧ｭ繝ｼ繝槭ｒ繧ｨ繧ｯ繧ｹ繝昴・繝井ｸｭ...");
-
-let idCounter = 0;
-const auxStore = { nextId: () => String(idCounter++), definitions: new Map() };
+console.log("噫 繧ｯ繝ｩ繧､繧｢繝ｳ繝亥髄縺代せ繧ｭ繝ｼ繝槭ｒ繧ｨ繧ｯ繧ｹ繝昴・繝井ｸｭ...");
 
 const deviceSchemas = new Map<string, z.ZodObject<any>>();
 for (const device of inventory) {
@@ -1196,7 +1366,8 @@ for (const device of inventory) {
 // ==========================================
 // 1. TypeScript迺ｰ蠅・髄縺・(.ts 縺ｮ邨・∩遶九※)
 // ==========================================
-const { node: msgNode } = zodToTs(wsClientMessageSchema, { auxiliaryTypeStore: auxStore });
+// v1.2.0縺ｮ莉墓ｧ倥↓蜷医ｏ縺帙∫ｬｬ2蠑墓焚縺ｫ逶ｴ謗･譁・ｭ怜・・亥梛蜷搾ｼ峨ｒ貂｡縺励∪縺・
+const { node: msgNode } = zodToTs(wsClientMessageSchema, "ClientMessage");
 const msgAlias = createTypeAlias(msgNode, "ClientMessage");
 
 let tsCode = `
@@ -1206,7 +1377,6 @@ let tsCode = `
  */
 
 // --- 騾壻ｿ｡繝｡繝・そ繝ｼ繧ｸ縺ｮ蝙・---
-// 庁 export 繧定ｿｽ蜉・・
 export ${printNode(msgAlias)}
 
 // --- 蜷・ョ繝舌う繧ｹ縺ｮ繝励Ο繝代ユ繧｣(迥ｶ諷・蝙・---
@@ -1218,10 +1388,10 @@ for (const [deviceType, schema] of deviceSchemas.entries()) {
   const typeName = `${deviceType}State`;
   stateTypeNames.push(typeName);
 
-  const { node } = zodToTs(schema, { auxiliaryTypeStore: auxStore });
+  // 縺薙％繧ょ酔讒倥↓隨ｬ2蠑墓焚繧呈枚蟄怜・縺ｫ縺励∪縺・
+  const { node } = zodToTs(schema, typeName);
   const alias = createTypeAlias(node, typeName);
   
-  // 庁 縺薙％縺ｫ繧・export 繧定ｿｽ蜉・・
   tsCode += `export ${printNode(alias)}\n\n`;
 }
 
@@ -1233,33 +1403,28 @@ if (stateTypeNames.length > 0) {
 await Bun.write("./frontend-protocol.ts", tsCode.trim());
 console.log("笨・TypeScript蝙句ｮ夂ｾｩ繧貞・蜉帙＠縺ｾ縺励◆ (frontend-protocol.ts)");
 
-
 // ==========================================
 // 2. 莉冶ｨ隱樒腸蠅・髄縺・(.json 縺ｮ邨・∩遶九※)
 // ==========================================
-const finalJsonSchema: any = {
-  $schema: "http://json-schema.org/draft-07/schema#",
-  description: "Simple AV Manager Protocol Schema",
-  definitions: {}
-};
+const definitions: Record<string, any> = {};
 
-// 庁 菫ｮ豁｣: 蜀阪・ `as any` 繧剃ｻ倥￠縺ｦTS繧ｳ繝ｳ繝代う繝ｩ繧貞ｼｷ蛻ｶ遯∫ｴ縺励∪縺呻ｼ・
-const msgJson = zodToJsonSchema(wsClientMessageSchema as any, { $refStrategy: "none" });
-if (msgJson) {
-  delete (msgJson as any).$schema;
-  finalJsonSchema.definitions["ClientMessage"] = msgJson;
-}
+const msgJson = zodToJsonSchema(wsClientMessageSchema, { $refStrategy: "none" }) as any;
+delete msgJson.$schema;
+definitions["ClientMessage"] = msgJson;
 
 for (const [deviceType, schema] of deviceSchemas.entries()) {
   const typeName = `${deviceType}State`;
-  
-  // 庁 菫ｮ豁｣: 縺薙％繧・`as any` 繧剃ｻ倥￠縺ｾ縺呻ｼ・
-  const devJson = zodToJsonSchema(schema as any, { $refStrategy: "none" });
-  if (devJson) {
-    delete (devJson as any).$schema;
-    finalJsonSchema.definitions[typeName] = devJson;
-  }
+  const devJson = zodToJsonSchema(schema, { $refStrategy: "none" }) as any;
+  delete devJson.$schema;
+  definitions[typeName] = devJson;
 }
+
+const finalJsonSchema = {
+  $schema: "http://json-schema.org/draft-07/schema#",
+  description: "Simple AV Manager Protocol Schema",
+  $ref: "#/definitions/ClientMessage",
+  definitions: definitions
+};
 
 await Bun.write("./protocol-schema.json", JSON.stringify(finalJsonSchema, null, 2));
 console.log("笨・JSON Schema繧貞・蜉帙＠縺ｾ縺励◆ (protocol-schema.json)");

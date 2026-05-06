@@ -4,15 +4,14 @@
  */
 
 // --- 通信メッセージの型 ---
-// 💡 export を追加！
 export type ClientMessage = {
     type: "UPDATE";
     ids: string[];
     patch: {
-        [key: string]: any;
+        [x: string]: any;
     };
-    options: {
-        immediateOnly: boolean;
+    options?: {
+        immediateOnly?: boolean;
     };
 } | {
     type: "ADD_SCHEDULE";
@@ -20,7 +19,7 @@ export type ClientMessage = {
     trigger: string;
     ids: string[];
     patch: {
-        [key: string]: any;
+        [x: string]: any;
     };
 } | {
     type: "GET_SCHEDULES";

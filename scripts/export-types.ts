@@ -5,10 +5,7 @@ import { z } from "zod";
 import { wsClientMessageSchema } from "../lib/ws-router";
 import { inventory } from "../lib/inventory";
 
-console.log("🛠️ クライアント向けスキーマをエクスポート中...");
-
-let idCounter = 0;
-const auxStore = { nextId: () => String(idCounter++), definitions: new Map() };
+console.log("🚀 クライアント向けスキーマをエクスポート中...");
 
 const deviceSchemas = new Map<string, z.ZodObject<any>>();
 for (const device of inventory) {
@@ -20,7 +17,8 @@ for (const device of inventory) {
 // ==========================================
 // 1. TypeScript環境向け (.ts の組み立て)
 // ==========================================
-const { node: msgNode } = zodToTs(wsClientMessageSchema, { auxiliaryTypeStore: auxStore });
+// v1.2.0の仕様に合わせ、第2引数に直接文字列（型名）を渡します
+const { node: msgNode } = zodToTs(wsClientMessageSchema, "ClientMessage");
 const msgAlias = createTypeAlias(msgNode, "ClientMessage");
 
 let tsCode = `
@@ -30,7 +28,6 @@ let tsCode = `
  */
 
 // --- 通信メッセージの型 ---
-// 💡 export を追加！
 export ${printNode(msgAlias)}
 
 // --- 各デバイスのプロパティ(状態)型 ---
@@ -42,10 +39,10 @@ for (const [deviceType, schema] of deviceSchemas.entries()) {
   const typeName = `${deviceType}State`;
   stateTypeNames.push(typeName);
 
-  const { node } = zodToTs(schema, { auxiliaryTypeStore: auxStore });
+  // ここも同様に第2引数を文字列にします
+  const { node } = zodToTs(schema, typeName);
   const alias = createTypeAlias(node, typeName);
   
-  // 💡 ここにも export を追加！
   tsCode += `export ${printNode(alias)}\n\n`;
 }
 
@@ -57,33 +54,28 @@ if (stateTypeNames.length > 0) {
 await Bun.write("./frontend-protocol.ts", tsCode.trim());
 console.log("✅ TypeScript型定義を出力しました (frontend-protocol.ts)");
 
-
 // ==========================================
 // 2. 他言語環境向け (.json の組み立て)
 // ==========================================
-const finalJsonSchema: any = {
-  $schema: "http://json-schema.org/draft-07/schema#",
-  description: "Simple AV Manager Protocol Schema",
-  definitions: {}
-};
+const definitions: Record<string, any> = {};
 
-// 💡 修正: 再び `as any` を付けてTSコンパイラを強制突破します！
-const msgJson = zodToJsonSchema(wsClientMessageSchema as any, { $refStrategy: "none" });
-if (msgJson) {
-  delete (msgJson as any).$schema;
-  finalJsonSchema.definitions["ClientMessage"] = msgJson;
-}
+const msgJson = zodToJsonSchema(wsClientMessageSchema, { $refStrategy: "none" }) as any;
+delete msgJson.$schema;
+definitions["ClientMessage"] = msgJson;
 
 for (const [deviceType, schema] of deviceSchemas.entries()) {
   const typeName = `${deviceType}State`;
-  
-  // 💡 修正: ここも `as any` を付けます！
-  const devJson = zodToJsonSchema(schema as any, { $refStrategy: "none" });
-  if (devJson) {
-    delete (devJson as any).$schema;
-    finalJsonSchema.definitions[typeName] = devJson;
-  }
+  const devJson = zodToJsonSchema(schema, { $refStrategy: "none" }) as any;
+  delete devJson.$schema;
+  definitions[typeName] = devJson;
 }
+
+const finalJsonSchema = {
+  $schema: "http://json-schema.org/draft-07/schema#",
+  description: "Simple AV Manager Protocol Schema",
+  $ref: "#/definitions/ClientMessage",
+  definitions: definitions
+};
 
 await Bun.write("./protocol-schema.json", JSON.stringify(finalJsonSchema, null, 2));
 console.log("✅ JSON Schemaを出力しました (protocol-schema.json)");

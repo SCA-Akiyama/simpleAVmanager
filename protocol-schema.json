@@ -1,9 +1,163 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "description": "Simple AV Manager Protocol Schema",
+  "$ref": "#/definitions/ClientMessage",
   "definitions": {
-    "ClientMessage": {},
-    "PjLinkDeviceState": {},
-    "BrightSignDeviceState": {}
+    "ClientMessage": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "UPDATE"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "patch": {
+              "type": "object",
+              "additionalProperties": {}
+            },
+            "options": {
+              "type": "object",
+              "properties": {
+                "immediateOnly": {
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              "additionalProperties": false,
+              "default": {
+                "immediateOnly": false
+              }
+            }
+          },
+          "required": [
+            "type",
+            "ids",
+            "patch"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "ADD_SCHEDULE"
+            },
+            "scheduleType": {
+              "type": "string",
+              "enum": [
+                "once",
+                "cron"
+              ]
+            },
+            "trigger": {
+              "type": "string"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "patch": {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "scheduleType",
+            "trigger",
+            "ids",
+            "patch"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "GET_SCHEDULES"
+            },
+            "start": {
+              "type": "string"
+            },
+            "end": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "DELETE_SCHEDULE"
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PjLinkDeviceState": {
+      "type": "object",
+      "properties": {
+        "power": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off",
+            "warming",
+            "cooling"
+          ]
+        },
+        "shutter": {
+          "type": "string",
+          "enum": [
+            "open",
+            "close"
+          ]
+        },
+        "volume": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "power",
+        "shutter",
+        "volume"
+      ],
+      "additionalProperties": false
+    },
+    "BrightSignDeviceState": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
   }
 }

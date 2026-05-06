@@ -1,5 +1,5 @@
 import { inventory } from "./inventory";
-import { stateDb } from "./db";
+import { stateDb, logDb } from "./db";
 import type { AVDevice } from "./types";
 
 // メモリ上の状態管理
@@ -42,7 +42,7 @@ export const deviceManager = {
   /**
    * ユーザー操作やAPIからの「理想」の更新を受け付ける (Fast Pathの起点)
    */
-updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
+  updateDesired: async (ids: string[], patch: any, options = { immediateOnly: false }) => {
     const now = Date.now();
 
     for (const id of ids) {
@@ -83,21 +83,18 @@ updateDesired: async (ids: string[], patch: any, options = { immediateOnly: fals
   },
  
   startPolling: (onSyncFinished?: () => void) => {
-    // inventory に登録されたデバイスごとに独立したループを立ち上げる
-    inventory.forEach(device => {
+    // 分散起動用のインターバル（例：10秒間で200台を捌くなら、1台あたり50msずらす）
+    const STAGGER_MS = 50; 
+
+    inventory.forEach((device, index) => {
       const runDeviceLoop = async () => {
-        // Slow Path として1台だけ同期
         await deviceManager.syncOne(device.id, true);
-        
-        // 同期が終わったらコールバックを発火（UIへ通知）
         if (onSyncFinished) onSyncFinished();
-        
-        // そのデバイスの通信が完了してから10秒後に次のサイクルを実行
         setTimeout(runDeviceLoop, 10000);
       };
 
-      // 初回起動
-      runDeviceLoop();
+      // 初回起動を少しずつずらす（Thundering Herd対策）
+      setTimeout(runDeviceLoop, index * STAGGER_MS);
     });
   },
 
@@ -201,10 +198,35 @@ updateDesired: async (ids: string[], patch: any, options = { immediateOnly: fals
       }
     }
 
+    const isNowOnline = !networkError;
+    const isNowError = controlError;
+    const prevActual = actualMap.get(id);
+    
+// 💡 状態が変化した瞬間のみログを記録する（スパム防止）
+    if (prevActual) {
+      // 1. ネットワーク状態の変化（LAN抜け・復旧など）
+      if (prevActual._online !== isNowOnline) {
+        if (isNowOnline) {
+          logDb.add("INFO", "SYSTEM", "DEVICE_RECOVERED", { message: "通信が復旧しました" }, id);
+        } else {
+          logDb.add("ERROR", "DEVICE", "DEVICE_OFFLINE", { message: "通信が途絶しました" }, id);
+        }
+      }
+
+      // 2. 機器の制御エラー状態の変化（コマンド拒否・解消など）
+      if (prevActual._error !== isNowError) {
+        if (isNowError) {
+          logDb.add("ERROR", "DEVICE", "DEVICE_ERROR", { message: "機器がエラーを返しています" }, id);
+        } else {
+          logDb.add("INFO", "SYSTEM", "ERROR_CLEARED", { message: "機器のエラーが解消しました" }, id);
+        }
+      }
+    }
+
     actualMap.set(id, { 
       ...actual, 
-      _online: !networkError, // ネットワーク通信が一度でも失敗すれば false
-      _error: controlError    // デバイスが一度でもエラーを返せば true
+      _online: isNowOnline, // ネットワーク通信が一度でも失敗すれば false
+      _error: isNowError    // デバイスが一度でもエラーを返せば true
     });
   },
 

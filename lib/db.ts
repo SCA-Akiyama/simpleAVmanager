@@ -76,3 +76,44 @@ export const scheduleDb = {
     return db.query("SELECT * FROM schedules").all() as any[];
   }
 };
+
+//  監査ログ用 
+db.run(`
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    timestamp INTEGER,
+    level TEXT,
+    source TEXT,
+    device_id TEXT,
+    action TEXT,
+    details TEXT
+  )
+`);
+
+export const logDb = {
+  // ログを追加する
+  add: (
+    level: "INFO" | "WARN" | "ERROR", 
+    source: "USER" | "CRON" | "DEVICE" | "SYSTEM", 
+    action: string, 
+    details: any, 
+    deviceId: string | null = null
+  ) => {
+    const query = db.prepare(`
+      INSERT INTO audit_logs (id, timestamp, level, source, device_id, action, details)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    `);
+    query.run(crypto.randomUUID(), Date.now(), level, source, deviceId, action, JSON.stringify(details));
+  },
+
+  // 指定した日数より古いログを削除する（デフォルト30日）
+  cleanupOldLogs: (daysToKeep = 30) => {
+    const cutoffTime = Date.now() - (daysToKeep * 24 * 60 * 60 * 1000);
+    db.query("DELETE FROM audit_logs WHERE timestamp < ?1").run(cutoffTime);
+  }
+};
+
+export const closeDb = () => {
+  db.close();
+  console.log("📦 データベース接続を安全に閉じました");
+};

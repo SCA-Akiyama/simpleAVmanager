@@ -1,6 +1,6 @@
 // src/lib/cron.ts
 import { deviceManager } from "./manager";
-import { scheduleDb } from "./db";
+import { scheduleDb , logDb} from "./db";
 
 // 💡 実行中のCronジョブを保持するMapを追加
 export const activeCronJobs = new Map<string, any>();
@@ -10,6 +10,7 @@ export const scheduleRecurring = (cronExp: string, ids: string[], patch: any, id
   
   // 💡 戻り値のジョブインスタンスを変数で受け取る
   const job = Bun.cron(cronExp, () => {
+    logDb.add("INFO", "CRON", "EXECUTE_CRON", { cronExp, patch }, ids.join(","));
     // ※ Mapでストップさせるため、毎回のDB生存確認(exists)は不要になります！
     deviceManager.updateDesired(ids, patch);
   });
@@ -93,6 +94,7 @@ export const initCronJobs = () => {
         const stillExists = scheduleDb.getAll().some((r: any) => r.id === row.id);
         
         if (stillExists) {
+          logDb.add("INFO", "CRON", "EXECUTE_ONCE", { trigger: row.trigger, patch }, ids.join(","));
           deviceManager.updateDesired(ids, patch);
           scheduleDb.delete(row.id); // 実行が完了した瞬間にDBから消す
         } else {
@@ -101,5 +103,10 @@ export const initCronJobs = () => {
         }
       }, delay);
     });
+  });
+
+  Bun.cron("0 3 * * *", () => {
+    logDb.cleanupOldLogs(30);
+    console.log("🧹 [ログローテーション] 30日以上前のログを削除しました");
   });
 };

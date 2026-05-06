@@ -1,7 +1,7 @@
 // src/lib/ws-router.ts
 import { z } from "zod";
 import { deviceManager } from "./manager";
-import { scheduleDb } from "./db";
+import { scheduleDb, logDb} from "./db";
 
 // --- スキーマ定義 ---
 
@@ -59,11 +59,13 @@ export const handleClientMessage = async (
 
     switch (msg.type) {
       case "UPDATE":
+        logDb.add("INFO", "USER", "UPDATE_DESIRED", { patch: msg.patch }, msg.ids.join(","));
         await deviceManager.updateDesired(msg.ids, msg.patch, msg.options);
         broadcastUpdate();
         break;
 
       case "ADD_SCHEDULE":
+        logDb.add("INFO", "USER", "ADD_SCHEDULE", { trigger: msg.trigger, patch: msg.patch, type: msg.scheduleType }, msg.ids.join(","));
         const { scheduleOnce, scheduleRecurring } = await import("./cron");
         if (msg.scheduleType === "once") {
           scheduleOnce(new Date(msg.trigger), msg.ids, msg.patch);
@@ -94,6 +96,7 @@ export const handleClientMessage = async (
         break;
 
       case "DELETE_SCHEDULE":
+        logDb.add("INFO", "USER", "DELETE_SCHEDULE", { schedule_id: msg.id });
         // 💡 データベースから削除
         scheduleDb.delete(msg.id);
         console.log(`🗑️ [スケジュール削除] ID: ${msg.id}`);

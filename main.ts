@@ -1,6 +1,7 @@
 import { deviceManager } from "./lib/manager";
 import { initCronJobs } from "./lib/cron";
 import { handleClientMessage } from "./lib/ws-router";
+import { closeDb } from "./lib/db";
 
 deviceManager.init();
 initCronJobs();
@@ -44,3 +45,13 @@ deviceManager.startPolling(() => {
 });
 
 console.log(`🚀 Server started at http://localhost:${server.port}`);
+
+const shutdown = () => {
+  console.log("\n🛑 サーバーのシャットダウンを開始します...");
+  server.stop(true); // 進行中のWebSocketやHTTPを安全に閉じる
+  closeDb();
+  process.exit(0);
+};
+
+process.on("SIGINT", shutdown);  // Ctrl+C
+process.on("SIGTERM", shutdown); // systemd や Docker からの終了シグナル
